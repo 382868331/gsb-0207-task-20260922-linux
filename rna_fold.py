@@ -1,12 +1,18 @@
-"""RNA secondary structure prediction with forced pairings.
+"""RNA secondary structure: optimum folding and Boltzmann marginals.
 
-Single public entry point: :func:`fold`.
+Two public entry points:
 
-The implementation is an exact, non-crossing (pseudoknot-free) interval
-dynamic program.  It performs an exhaustive search over every admissible
-structure -- it never samples -- so a returned optimum is proven optimal and a
-rejected constraint set is proven unsatisfiable.  See README.md for the full
-contract.
+* :func:`fold` -- an exact, non-crossing (pseudoknot-free) interval dynamic
+  program returning a maximum-score structure.  It performs an exhaustive
+  search over every admissible structure -- it never samples -- so a returned
+  optimum is proven optimal and a rejected constraint set is proven
+  unsatisfiable.
+* :func:`partition_function` -- the same structure space weighted by
+  ``exp(-E / T)`` with integer pair/unpaired energies, evaluated in log
+  space; returns ``ln Z`` and base-pair / unpaired marginal probabilities
+  for sequences up to :data:`MAX_PARTITION_LENGTH` (20).
+
+See README.md for the full contract.
 """
 
 from __future__ import annotations
@@ -16,13 +22,16 @@ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 __all__ = [
     "fold",
+    "partition_function",
     "InvalidSequenceError",
     "ConstraintError",
     "UnsatisfiableConstraintError",
     "BudgetExceededError",
     "MIN_HAIRPIN",
     "MAX_SEQUENCE_LENGTH",
+    "MAX_PARTITION_LENGTH",
     "PAIR_SCORES",
+    "DEFAULT_PAIR_ENERGIES",
     "MOD",
 ]
 
@@ -30,6 +39,12 @@ MIN_HAIRPIN = 3
 """Minimum number of *unpaired* positions inside a pair (j - i >= 4)."""
 
 MAX_SEQUENCE_LENGTH = 120
+
+#: The Boltzmann partition function is offered up to this length.  The inside/
+#: outside DP itself is O(n**3), but the contract for this iteration caps the
+#: stochastic entry point here (short sequences are cross-checked by exhaustive
+#: enumeration in the tests).
+MAX_PARTITION_LENGTH = 20
 
 MOD = 1_000_000_007
 
@@ -43,8 +58,25 @@ PAIR_SCORES: Dict[Tuple[str, str], int] = {
     ("U", "G"): 1,
 }
 
+#: Default integer pair energies used by :func:`partition_function`.
+#: Favorable pairs carry negative energy (GC strongest, GU weakest); the
+#: table is the energetic counterpart of :data:`PAIR_SCORES`.  Keys are the
+#: six oriented two-letter pair names; a user-supplied table must give all
+#: six (integer) values.
+DEFAULT_PAIR_ENERGIES: Dict[str, int] = {
+    "GC": -3,
+    "CG": -3,
+    "AU": -2,
+    "UA": -2,
+    "GU": -1,
+    "UG": -1,
+}
+
+_PAIR_ENERGY_KEYS = frozenset(DEFAULT_PAIR_ENERGIES)
+
 _ALPHABET = frozenset("ACGU")
 _NEG = -10**18
+_NEG_INF = float("-inf")
 
 # Bracket styles accepted when constraints are given as a string.
 _OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}", "<": ">"}
@@ -106,15 +138,15 @@ def _as_int(value: object, where: str) -> int:
     return value
 
 
-def _validate_sequence(sequence: object) -> str:
+def _validate_sequence(sequence: object, max_length: int = MAX_SEQUENCE_LENGTH) -> str:
     if not isinstance(sequence, str):
         raise TypeError(
             f"sequence: expected str, got {type(sequence).__name__}"
         )
     n = len(sequence)
-    if n > MAX_SEQUENCE_LENGTH:
+    if n > max_length:
         raise InvalidSequenceError(
-            f"sequence length {n} exceeds maximum {MAX_SEQUENCE_LENGTH}"
+            f"sequence length {n} exceeds maximum {max_length}"
         )
     for i, ch in enumerate(sequence):
         if ch not in _ALPHABET:
@@ -512,4 +544,331 @@ def fold(
         "structure": lex[0][n],
         "count": ways[0][n],
         "pairs": tuple(sorted(can_pair)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Boltzmann partition function and base-pair marginals
+# ---------------------------------------------------------------------------
+
+
+def _logsumexp(values: List[float]) -> float:
+    """Numerically stable ``log(sum(exp(v)))``; ``-inf`` inputs are ignored.
+
+    The shift keeps every exponent <= 0 (no overflow); ``math.fsum`` gives a
+    correctly rounded sum of the (already small) exponent terms, so the result
+    stays accurate even when the spread between terms is large.
+    """
+    finite = [v for v in values if v != _NEG_INF]
+    if not finite:
+        return _NEG_INF
+    shift = max(finite)
+    return shift + math.log(math.fsum(math.exp(v - shift) for v in finite))
+
+
+def _validate_temperature(temperature: object) -> float:
+    if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
+        raise TypeError(
+            "temperature: expected a positive number, got "
+            f"{type(temperature).__name__}"
+        )
+    try:
+        t = float(temperature)
+    except OverflowError as exc:
+        raise ValueError(
+            f"temperature: value {temperature!r} is too large to convert "
+            "to a finite float"
+        ) from exc
+    if math.isnan(t):
+        raise ValueError("temperature: NaN is not a valid temperature")
+    if math.isinf(t):
+        raise ValueError("temperature: Infinity is not a finite temperature")
+    if t <= 0.0:
+        raise ValueError(
+            f"temperature: must be strictly positive, got {temperature!r}"
+        )
+    return t
+
+
+def _validate_energies(
+    pair_energies: object, unpaired_energy: object
+) -> Tuple[Dict[Tuple[str, str], float], float, Dict[str, int]]:
+    """Validate the integer energy model; return (oriented table, unpaired, copy)."""
+    table: Dict[str, int] = dict(DEFAULT_PAIR_ENERGIES)
+    if pair_energies is not None:
+        if not isinstance(pair_energies, Mapping):
+            raise TypeError(
+                "pair_energies: expected a mapping of pair name to integer "
+                f"energy, got {type(pair_energies).__name__}"
+            )
+        unknown = set(pair_energies) - _PAIR_ENERGY_KEYS
+        if unknown:
+            raise ValueError(
+                f"pair_energies: unknown key(s) {sorted(unknown)!r}; allowed "
+                f"keys are {sorted(_PAIR_ENERGY_KEYS)!r}"
+            )
+        for key, val in pair_energies.items():
+            table[key] = _as_int(val, f"pair_energies[{key!r}]")
+
+    u = _as_int(unpaired_energy, "unpaired_energy")
+
+    def _as_float(value: int, where: str) -> float:
+        try:
+            f = float(value)
+        except OverflowError as exc:
+            raise ValueError(
+                f"{where}: integer {value!r} is too large to convert to "
+                "a finite float"
+            ) from exc
+        if not math.isfinite(f):
+            raise ValueError(
+                f"{where}: integer {value!r} converts to a non-finite "
+                "float; energy magnitudes must stay finite"
+            )
+        return f
+
+    oriented: Dict[Tuple[str, str], float] = {}
+    for name, energy in table.items():
+        oriented[(name[0], name[1])] = _as_float(energy, f"pair_energies[{name!r}]")
+    return oriented, _as_float(u, "unpaired_energy"), table
+
+
+def partition_function(
+    sequence: str,
+    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+    *,
+    temperature: "int | float" = 1.0,
+    pair_energies: Optional[Mapping[str, int]] = None,
+    unpaired_energy: int = 0,
+) -> Dict[str, object]:
+    """Boltzmann partition function and base-pair marginal probabilities.
+
+    Every admissible non-crossing structure (same legality rules and same
+    hard constraints as :func:`fold`) gets Boltzmann weight
+    ``exp(-E / T)`` with *integer* energies::
+
+        E(structure) = sum of pair energies over its pairs
+                       + unpaired_energy * (#unpaired positions)
+
+    All computation runs in log space (inside/outside DP with a stable
+    log-sum-exp), so weights that would overflow or underflow as plain
+    exponentials do not hurt the result.
+
+    :param sequence: RNA sequence over ``A C G U`` (case sensitive),
+        length <= :data:`MAX_PARTITION_LENGTH` (20).
+    :param constraints: same forms and rules as in :func:`fold`.
+    :param temperature: positive ``T > 0`` (int or finite float; ``bool``,
+        NaN, Infinity and non-positive values are rejected).
+    :param pair_energies: optional mapping overriding the default integer
+        pair energies (:data:`DEFAULT_PAIR_ENERGIES`: GC/CG=-3, AU/UA=-2,
+        GU/UG=-1).  Keys are oriented ``"GC"`` ... ``"UG"``; partial
+        overrides are allowed; values must be integers (``bool`` rejected).
+    :param unpaired_energy: integer energy contributed by every unpaired
+        position (default 0).
+    :returns: dict with
+
+        * ``log_partition`` (float): ``ln Z``;
+        * ``free_energy`` (float): ``-T * ln Z``;
+        * ``temperature`` (float): the temperature used;
+        * ``pair_energies`` (dict): the full effective six-key integer table;
+        * ``unpaired_energy`` (int);
+        * ``pair_prob_matrix``: ``n x n`` list of float with
+          ``pair_prob_matrix[i][j]`` the marginal probability of pair
+          ``(i, j)`` for ``i < j`` (zero elsewhere);
+        * ``pair_probabilities``: tuple of ``(i, j, p)`` for every legal
+          pair with ``p > 0``, sorted by ``(i, j)``;
+        * ``unpaired_probabilities``: list of float, marginal probability
+          that each position is unpaired.
+
+        The marginals satisfy, up to floating-point rounding,
+        ``unpaired_probabilities[i] + sum_j matrix[i][j] + sum_j matrix[j][i]
+        == 1``.
+    :raises TypeError: wrong value types (including ``bool`` as a number).
+    :raises ValueError: non-positive/NaN/Infinite temperature or unknown
+        energy keys.
+    :raises InvalidSequenceError: bad length (> 20) or illegal character.
+    :raises ConstraintError: malformed or conflicting constraints.
+    :raises UnsatisfiableConstraintError: proven that no admissible
+        structure satisfies the forced constraints.
+    """
+    seq = _validate_sequence(sequence, MAX_PARTITION_LENGTH)
+    partner, force_up = _normalise_constraints(constraints, seq)
+    temp = _validate_temperature(temperature)
+    energy_table, e_unpaired, effective = _validate_energies(
+        pair_energies, unpaired_energy
+    )
+    n = len(seq)
+    beta = 1.0 / temp
+    w_unpaired = -e_unpaired * beta
+
+    # Same closed-interval mechanism as fold(): the DP only moves across
+    # intervals that do not strand a forced endpoint from its mate.
+    closed: List[List[bool]] = [[False] * (n + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        endpoint_count = 0
+        inside_pairs = 0
+        closed[i][i] = True
+        for j in range(i + 1, n + 1):
+            p = j - 1
+            if partner[p] != -1:
+                endpoint_count += 1
+                m = partner[p]
+                if i <= m < p:
+                    inside_pairs += 1
+            closed[i][j] = endpoint_count == 2 * inside_pairs
+
+    def pair_allowed(i: int, t: int) -> bool:
+        if force_up[i] or force_up[t]:
+            return False
+        if partner[i] != -1 and partner[i] != t:
+            return False
+        if partner[t] != -1 and partner[t] != i:
+            return False
+        return (seq[i], seq[t]) in energy_table
+
+    # ---- Inside pass: Q[i][j] = ln sum of weights on interval [i, j) -----
+    q_in: List[List[float]] = [
+        [_NEG_INF] * (n + 1) for _ in range(n + 1)
+    ]
+    for i in range(n + 1):
+        q_in[i][i] = 0.0  # empty interval has one structure, weight 1
+
+    for length in range(1, n + 1):
+        for i in range(0, n - length + 1):
+            j = i + length
+            terms: List[float] = []
+
+            # i unpaired.
+            if partner[i] == -1 and closed[i + 1][j]:
+                terms.append(w_unpaired + q_in[i + 1][j])
+
+            # i paired with t.
+            for t in range(i + MIN_HAIRPIN + 1, j):
+                if not pair_allowed(i, t):
+                    continue
+                if not closed[i + 1][t] or not closed[t + 1][j]:
+                    continue
+                q1 = q_in[i + 1][t]
+                q2 = q_in[t + 1][j]
+                if q1 == _NEG_INF or q2 == _NEG_INF:
+                    continue
+                w_pair = -energy_table[(seq[i], seq[t])] * beta
+                terms.append(w_pair + q1 + q2)
+
+            q_in[i][j] = _logsumexp(terms)
+
+    log_z = q_in[0][n]
+    if log_z == _NEG_INF:
+        raise UnsatisfiableConstraintError(
+            "constraints are unsatisfiable: no admissible structure contains "
+            "all forced pairs"
+        )
+
+    # ---- Outside pass: q_out[i][j] for contexts enclosing [i, j) ---------
+    q_out: List[List[float]] = [
+        [_NEG_INF] * (n + 1) for _ in range(n + 1)
+    ]
+    q_out[0][n] = 0.0
+
+    for length in range(n, 0, -1):
+        for i in range(0, n - length + 1):
+            j = i + length
+            qo = q_out[i][j]
+            if qo == _NEG_INF:
+                continue
+
+            # Context where i is unpaired -> remainder interval [i+1, j).
+            if (
+                partner[i] == -1
+                and closed[i + 1][j]
+                and q_in[i + 1][j] != _NEG_INF
+            ):
+                cand = qo + w_unpaired
+                # Every qualifying context adds weight mass -- this must be
+                # logsumexp even when cand is smaller than the accumulated
+                # value, never a max-style conditional update.
+                q_out[i + 1][j] = _logsumexp(
+                    [q_out[i + 1][j], cand]
+                )
+
+            # Context where i pairs with t -> children [i+1, t), [t+1, j).
+            for t in range(i + MIN_HAIRPIN + 1, j):
+                if not pair_allowed(i, t):
+                    continue
+                if not closed[i + 1][t] or not closed[t + 1][j]:
+                    continue
+                q1 = q_in[i + 1][t]
+                q2 = q_in[t + 1][j]
+                if q1 == _NEG_INF or q2 == _NEG_INF:
+                    continue
+                base = qo - energy_table[(seq[i], seq[t])] * beta
+                cand_in = base + q2  # outside context for [i+1, t)
+                cand_out = base + q1  # outside context for [t+1, j)
+                q_out[i + 1][t] = _logsumexp(
+                    [q_out[i + 1][t], cand_in]
+                )
+                q_out[t + 1][j] = _logsumexp(
+                    [q_out[t + 1][j], cand_out]
+                )
+
+    # ---- Marginals --------------------------------------------------------
+    matrix: List[List[float]] = [
+        [0.0] * n for _ in range(n)
+    ]
+    triples: List[Tuple[int, int, float]] = []
+    for i in range(n):
+        for t in range(i + MIN_HAIRPIN + 1, n):
+            if not pair_allowed(i, t) or not closed[i + 1][t]:
+                continue
+            # Pair (i, t) is created inside an interval [i, j) for any
+            # j > t; q_out[i][j] sums every external context producing it.
+            contexts: List[float] = []
+            w_pair = -energy_table[(seq[i], seq[t])] * beta
+            for j in range(t + 1, n + 1):
+                if not closed[t + 1][j]:
+                    continue
+                q1 = q_in[i + 1][t]
+                q2 = q_in[t + 1][j]
+                qo = q_out[i][j]
+                if (
+                    q1 == _NEG_INF
+                    or q2 == _NEG_INF
+                    or qo == _NEG_INF
+                ):
+                    continue
+                contexts.append(w_pair + q1 + q2 + qo)
+            log_p = _logsumexp(contexts)
+            if log_p == _NEG_INF:
+                continue
+            p = math.exp(log_p - log_z)
+            if p > 0.0:
+                matrix[i][t] = p
+                triples.append((i, t, p))
+
+    unpaired: List[float] = []
+    for i in range(n):
+        contexts = []
+        if partner[i] == -1:
+            for j in range(i + 1, n + 1):
+                if not closed[i + 1][j]:
+                    continue
+                q1 = q_in[i + 1][j]
+                qo = q_out[i][j]
+                if q1 == _NEG_INF or qo == _NEG_INF:
+                    continue
+                contexts.append(w_unpaired + q1 + qo)
+        log_p = _logsumexp(contexts)
+        unpaired.append(
+            0.0 if log_p == _NEG_INF else math.exp(log_p - log_z)
+        )
+
+    return {
+        "log_partition": log_z,
+        "free_energy": -temp * log_z,
+        "temperature": temp,
+        "pair_energies": effective,
+        "unpaired_energy": int(e_unpaired),
+        "pair_prob_matrix": matrix,
+        "pair_probabilities": tuple(triples),
+        "unpaired_probabilities": unpaired,
     }

@@ -8,7 +8,8 @@ its expected values are derived independently of the production DP.
 
 from __future__ import annotations
 
-from typing import Dict, FrozenSet, List, Optional, Tuple
+import math
+from typing import Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 PAIR_SCORES = {
     ("G", "C"): 3,
@@ -130,4 +131,79 @@ def brute_force(
         "count": opt_count % MOD,
         "exact_count": opt_count,
         "pairs": frozenset(all_pairs),
+    }
+
+
+DEFAULT_PAIR_ENERGIES = {
+    "GC": -3,
+    "CG": -3,
+    "AU": -2,
+    "UA": -2,
+    "GU": -1,
+    "UG": -1,
+}
+
+
+def brute_partition(
+    seq: str,
+    forced_pairs: Optional[FrozenSet[Tuple[int, int]]] = None,
+    forced_unpaired: Optional[frozenset] = None,
+    temperature: float = 1.0,
+    pair_energies: Optional[Mapping[str, int]] = None,
+    unpaired_energy: int = 0,
+) -> Dict[str, object]:
+    """Exact Boltzmann reference obtained by *enumerating every structure*.
+
+    Independently of the production log-space DP it walks the full structure
+    list from :func:`_enumerate`, filters structures by the forced pairs
+    post hoc, and accumulates plain Boltzmann weights ``exp(-E / T)``
+    directly.  It returns exact (for double precision at these sizes)
+    quantities: the partition sum ``z``, its log, per-pair marginals, and
+    per-position unpaired marginals.
+    """
+    forced_pairs = forced_pairs or frozenset()
+    forced_unpaired = forced_unpaired or frozenset()
+    n = len(seq)
+    up = [p in forced_unpaired for p in range(n)]
+
+    energies = dict(DEFAULT_PAIR_ENERGIES)
+    if pair_energies is not None:
+        energies.update(pair_energies)
+
+    z = 0.0
+    pair_weight: Dict[Tuple[int, int], float] = {}
+    unpaired_weight: List[float] = [0.0] * n
+
+    # The forced-unpaired restriction is applied during enumeration (the
+    # generator honors ``force_unpaired``); forced *pairs* are post-filtered,
+    # mirroring brute_force's deliberately independent mechanism.
+    for _sc, _s, pr in _enumerate(seq, up):
+        if not all(p in pr for p in forced_pairs):
+            continue
+        e = sum(energies[seq[a] + seq[b]] for a, b in pr)
+        e += unpaired_energy * (n - 2 * len(pr))
+        w = math.exp(-e / temperature)
+        z += w
+        for a, b in pr:
+            pair_weight[(a, b)] = pair_weight.get((a, b), 0.0) + w
+        paired_positions = {p for ab in pr for p in ab}
+        for k in range(n):
+            if k not in paired_positions:
+                unpaired_weight[k] += w
+
+    if z == 0.0:
+        return {
+            "feasible": False,
+            "log_partition": float("-inf"),
+            "z": 0.0,
+            "pair_prob": {},
+            "unpaired_prob": [0.0] * n,
+        }
+
+    return {
+        "feasible": True,
+        "log_partition": math.log(z),
+        "z": z,
+        "pair_prob": {p: w / z for p, w in pair_weight.items()},
+        "unpaired_prob": [w / z for w in unpaired_weight],
     }
