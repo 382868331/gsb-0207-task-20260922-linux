@@ -24,6 +24,7 @@ __all__ = [
     "MAX_SEQUENCE_LENGTH",
     "PAIR_SCORES",
     "MOD",
+    "score_structure",
 ]
 
 MIN_HAIRPIN = 3
@@ -306,9 +307,126 @@ def _normalise_constraints(
 # ---------------------------------------------------------------------------
 
 
+def _normalise_scoring(
+    unpaired_scores: object, stack_score: object, n: int
+) -> Tuple[List[int], int]:
+    """Validate the optional scoring parameters.
+
+    ``unpaired_scores`` must be a length-``n`` iterable of integers (strings
+    and bytes rejected); ``stack_score`` must be a single integer.  Booleans
+    and non-finite floats follow the module-wide numeric contract.
+    """
+    if unpaired_scores is None:
+        scores = [0] * n
+    else:
+        if isinstance(unpaired_scores, (str, bytes)):
+            raise TypeError(
+                "unpaired_scores: expected an iterable of integers, not a "
+                "string"
+            )
+        try:
+            raw = list(unpaired_scores)
+        except TypeError as exc:
+            raise TypeError("unpaired_scores: value is not iterable") from exc
+        if len(raw) != n:
+            raise ConstraintError(
+                f"unpaired_scores length {len(raw)} != sequence length {n}"
+            )
+        scores = [
+            _as_int(v, f"unpaired_scores[{k}]") for k, v in enumerate(raw)
+        ]
+
+    if stack_score is None:
+        stack = 0
+    else:
+        stack = _as_int(stack_score, "stack_score")
+    return scores, stack
+
+
+def score_structure(
+    sequence: str,
+    structure: str,
+    unpaired_scores: "Optional[Iterable[int]]" = None,
+    stack_score: int = 0,
+) -> int:
+    """Score a concrete dot-bracket ``structure`` under the full scoring rule.
+
+    Pair scores are GC/CG=3, AU/UA=2, GU/UG=1; every unpaired position adds
+    ``unpaired_scores[p]`` (default 0); every directly nested adjacent pair
+    stack ``(i, j)`` + ``(i+1, j-1)`` adds ``stack_score`` once (default 0).
+
+    The structure must be a balanced dot-bracket string of the sequence
+    length whose pairs are complementary, satisfy the minimum hairpin length,
+    and never cross (a dot-bracket string cannot express crossings).
+    :class:`InvalidSequenceError` / :class:`ConstraintError` are raised on
+    malformed input, with position information.
+    """
+    seq = _validate_sequence(sequence)
+    n = len(seq)
+    if not isinstance(structure, str):
+        raise TypeError(
+            f"structure: expected str, got {type(structure).__name__}"
+        )
+    if len(structure) != n:
+        raise ConstraintError(
+            f"structure length {len(structure)} != sequence length {n}"
+        )
+    up_scores, stack = _normalise_scoring(unpaired_scores, stack_score, n)
+
+    total = 0
+    open_stack: List[int] = []
+    partner_of: Dict[int, int] = {}
+    for p, ch in enumerate(structure):
+        if ch == ".":
+            total += up_scores[p]
+        elif ch == "(":
+            open_stack.append(p)
+        elif ch == ")":
+            if not open_stack:
+                raise ConstraintError(
+                    f"structure position {p} (0-based): closing bracket has "
+                    "no matching opening bracket"
+                )
+            a = open_stack.pop()
+            b = p
+            if b - a <= MIN_HAIRPIN:
+                raise ConstraintError(
+                    f"structure pair ({a}, {b}): pairs enclose at least "
+                    f"{MIN_HAIRPIN} unpaired positions, so j - i must be >= "
+                    f"{MIN_HAIRPIN + 1}"
+                )
+            w = PAIR_SCORES.get((seq[a], seq[b]))
+            if w is None:
+                raise ConstraintError(
+                    f"structure pair ({a}, {b}): {seq[a]!r}-{seq[b]!r} is "
+                    "not an allowed pair (allowed: AU, UA, GC, CG, GU, UG)"
+                )
+            total += w
+            partner_of[a] = b
+            partner_of[b] = a
+        else:
+            raise ConstraintError(
+                f"structure position {p} (0-based): illegal character "
+                f"{ch!r}; allowed: ( ) ."
+            )
+    if open_stack:
+        p = open_stack[-1]
+        raise ConstraintError(
+            f"structure position {p} (0-based): opening bracket is never "
+            "closed"
+        )
+    for a, b in partner_of.items():
+        if a < b and b >= 2 and partner_of.get(b - 1, -1) == a + 1:
+            total += stack
+    return total
+
+
 def fold(
     sequence: str,
     constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+    *,
+    unpaired_scores: "Optional[Iterable[object]]" = None,
+    stack_score: "Optional[int]" = None,
 ) -> Dict[str, object]:
     """Fold ``sequence`` into a maximum-score non-crossing secondary structure.
 
@@ -324,9 +442,18 @@ def fold(
 
         Forced pairs must be complementary, satisfy ``j - i >= 4``, share no
         endpoint, and not cross.
+    :param unpaired_scores: optional length-``n`` iterable of integers;
+        leaving position ``p`` unpaired adds ``unpaired_scores[p]`` to the
+        total.  Defaults to all zeros; negative values are allowed (a cost
+        for leaving the position unpaired).
+    :param stack_score: optional integer added **once** for every directly
+        nested adjacent pair of pairs, i.e. whenever both ``(i, j)`` and
+        ``(i + 1, j - 1)`` occur.  Defaults to 0; may be negative.
     :returns: dict with
 
-        * ``score`` (int): maximum total score (GC=3, AU=2, GU=1);
+        * ``score`` (int): maximum total score = sum of pair scores
+          (GC=3, AU=2, GU=1) + unpaired-position scores + adjacent nesting
+          bonuses;
         * ``structure`` (str): lexicographically smallest dot-bracket string
           among all maximum-score structures (ASCII order, so ``'(' < ')' <
           '.'``);
@@ -343,6 +470,7 @@ def fold(
     seq = _validate_sequence(sequence)
     partner, force_up = _normalise_constraints(constraints, seq)
     n = len(seq)
+    up_scores, stack = _normalise_scoring(unpaired_scores, stack_score, n)
 
     # A *closed* interval [i, j) is one where every position p in [i, j)
     # with a forced mate also has that mate inside [i, j).  The DP only
@@ -378,138 +506,244 @@ def fold(
             return False
         return True
 
-    # Half-open intervals [i, j), 0 <= i <= j <= n.
-    best: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
-    ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
+    # Three DP tables over half-open intervals [i, j):
+    #
+    # f  [i][j]: best score / count of ALL admissible structures;
+    # c  [i][j]: structures whose boundary forms the pair (i, j-1);
+    # nb [i][j]: structures whose boundary does NOT form that pair.
+    # f is the disjoint union of c and nb.  The boundary state is required
+    # because the adjacent nesting bonus depends on whether the inner
+    # interval ACTUALLY pairs its own boundary; it cannot be recovered from a
+    # dot-bracket after the fact, and keeping c and nb disjoint guarantees
+    # every structure is counted exactly once even when several interval
+    # decompositions lead to the same matching.
+    #
+    # Transitions:
+    #   f[i][j] = i unpaired: up[i] + f[i+1][j]
+    #           | i pairs t  : w(i,t) + f[t+1][j]
+    #                        + max-merge(c[i+1][t] + stack, nb[i+1][t])
+    #   c[i][j] keeps only the t = j-1 pairing terms;
+    #   nb[i][j] keeps the unpaired term and pairing terms t < j-1.
+    f_best: List[List[int]] = [[_NEG] * (n + 1) for _ in range(n + 1)]
+    f_ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
+    c_best: List[List[int]] = [[_NEG] * (n + 1) for _ in range(n + 1)]
+    c_ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
+    nb_best: List[List[int]] = [[_NEG] * (n + 1) for _ in range(n + 1)]
+    nb_ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
     for i in range(n + 1):
-        ways[i][i] = 1
+        f_best[i][i] = 0
+        f_ways[i][i] = 1
+        nb_best[i][i] = 0
+        nb_ways[i][i] = 1
+
+    def merge(top: int, total: int, v: int, w: int):
+        if v > top:
+            return v, w
+        if v == top:
+            return top, (total + w) % MOD
+        return top, total
 
     for length in range(1, n + 1):
         for i in range(0, n - length + 1):
             j = i + length
-            top = _NEG
-            total = 0
+            top = nb_top = c_top = _NEG
+            total = nb_total = c_total = 0
 
-            # Option 1: position i stays unpaired (impossible if its mate is
-            # forced, or if its mate would be stranded outside the remainder).
+            # Term A: position i stays unpaired -> f and nb, never c.
             if partner[i] == -1 and closed[i + 1][j]:
-                v = best[i + 1][j]
-                w = ways[i + 1][j]
-                if v > top:
-                    top, total = v, w
-                elif v == top:
-                    total = (total + w) % MOD
+                v = up_scores[i] + f_best[i + 1][j]
+                w = f_ways[i + 1][j]
+                top, total = merge(top, total, v, w)
+                nb_top, nb_total = merge(nb_top, nb_total, v, w)
 
-            # Option 2: i pairs with t.
+            # Term B: i pairs with t; the interior split on the boundary
+            # state decides whether the stack bonus is earned exactly once.
             for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
+                if not pair_allowed(i, t) or not closed[t + 1][j]:
                     continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
+                s_out = f_best[t + 1][j]
+                if s_out == _NEG:
                     continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                w = (ways[i + 1][t] * ways[t + 1][j]) % MOD
-                if v > top:
-                    top, total = v, w
-                elif v == top:
-                    total = (total + w) % MOD
+                w_out = f_ways[t + 1][j]
+                pair_w = PAIR_SCORES[(seq[i], seq[t])]
 
-            best[i][j] = top
-            ways[i][j] = total
+                in_top = _NEG
+                in_total = 0
+                if c_best[i + 1][t] != _NEG:
+                    in_top, in_total = merge(
+                        in_top, in_total,
+                        stack + c_best[i + 1][t], c_ways[i + 1][t],
+                    )
+                if nb_best[i + 1][t] != _NEG:
+                    in_top, in_total = merge(
+                        in_top, in_total,
+                        nb_best[i + 1][t], nb_ways[i + 1][t],
+                    )
+                if in_top == _NEG:
+                    continue
+                v = pair_w + in_top + s_out
+                w = (in_total * w_out) % MOD
+                top, total = merge(top, total, v, w)
+                if t == j - 1:
+                    c_top, c_total = merge(c_top, c_total, v, w)
+                else:
+                    nb_top, nb_total = merge(nb_top, nb_total, v, w)
 
-    if best[0][n] == _NEG:
+            f_best[i][j], f_ways[i][j] = top, total
+            c_best[i][j], c_ways[i][j] = c_top, c_total
+            nb_best[i][j], nb_ways[i][j] = nb_top, nb_total
+
+    if f_best[0][n] == _NEG:
         raise UnsatisfiableConstraintError(
             "constraints are unsatisfiable: no admissible structure contains "
             "all forced pairs"
         )
 
-    # Lexicographically smallest optimal structure per interval.
-    lex: List[List[str]] = [[""] * (n + 1) for _ in range(n + 1)]
+    # Replay every table with the same decision terms, collecting the lex
+    # smallest witness fragment and propagating interval reachability.
+    # Feasibility is tracked by best != _NEG only: ways is reduced modulo
+    # MOD and may legitimately be 0 for a non-empty structure set, so it must
+    # never gate reachability (otherwise a pair appearing only behind a count
+    # that is 0 mod MOD would be wrongly omitted).
+    f_lex: List[List[Optional[str]]] = [
+        [None] * (n + 1) for _ in range(n + 1)
+    ]
+    c_lex: List[List[Optional[str]]] = [
+        [None] * (n + 1) for _ in range(n + 1)
+    ]
+    nb_lex: List[List[Optional[str]]] = [
+        [None] * (n + 1) for _ in range(n + 1)
+    ]
+    for i in range(n + 1):
+        f_lex[i][i] = nb_lex[i][i] = ""
+
+    f_reach = [[False] * (n + 1) for _ in range(n + 1)]
+    c_reach = [[False] * (n + 1) for _ in range(n + 1)]
+    nb_reach = [[False] * (n + 1) for _ in range(n + 1)]
+    f_reach[0][n] = True
+    can_pair: set[Tuple[int, int]] = set()
+
+    def interior_options(i: int, t: int):
+        """Optimal interior decompositions of pair (i, t): (value, kind)."""
+        if c_best[i + 1][t] != _NEG:
+            yield stack + c_best[i + 1][t], "c"
+        if nb_best[i + 1][t] != _NEG:
+            yield nb_best[i + 1][t], "nb"
+
     for length in range(1, n + 1):
         for i in range(0, n - length + 1):
             j = i + length
-            if best[i][j] == _NEG:
-                continue  # infeasible interval: no witness string
-            target = best[i][j]
-            chosen: Optional[str] = None
+            f_pieces: List[str] = []
+            c_pieces: List[str] = []
+            nb_pieces: List[str] = []
 
-            if (
-                partner[i] == -1
-                and closed[i + 1][j]
-                and best[i + 1][j] == target
-            ):
-                chosen = "." + lex[i + 1][j]
+            if partner[i] == -1 and closed[i + 1][j]:
+                v = up_scores[i] + f_best[i + 1][j]
+                if v == f_best[i][j]:
+                    f_pieces.append("." + f_lex[i + 1][j])
+                if v == nb_best[i][j]:
+                    nb_pieces.append("." + f_lex[i + 1][j])
 
             for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
+                if not pair_allowed(i, t) or not closed[t + 1][j]:
                     continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
+                s_out = f_best[t + 1][j]
+                if s_out == _NEG:
                     continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                if v != target:
-                    continue
-                candidate = (
-                    "(" + lex[i + 1][t] + ")" + lex[t + 1][j]
+                pair_w = PAIR_SCORES[(seq[i], seq[t])]
+                in_best = max(
+                    stack + c_best[i + 1][t],
+                    nb_best[i + 1][t],
                 )
-                if chosen is None or candidate < chosen:
-                    chosen = candidate
+                if in_best == _NEG:
+                    continue
+                v = pair_w + in_best + s_out
+                if v not in (f_best[i][j], c_best[i][j], nb_best[i][j]):
+                    continue
+                for in_val, kind in interior_options(i, t):
+                    if in_val != in_best:
+                        continue
+                    inner_lex = c_lex if kind == "c" else nb_lex
+                    frag = (
+                        "(" + inner_lex[i + 1][t] + ")"
+                        + f_lex[t + 1][j]
+                    )
+                    if v == f_best[i][j]:
+                        f_pieces.append(frag)
+                    if t == j - 1 and v == c_best[i][j]:
+                        c_pieces.append(frag)
+                    if t < j - 1 and v == nb_best[i][j]:
+                        nb_pieces.append(frag)
 
-            # Feasible intervals always have a witness (root is feasible and
-            # table values are maxima over enumerated options).
-            assert chosen is not None and len(chosen) == length
-            lex[i][j] = chosen
+            if f_best[i][j] != _NEG:
+                assert f_pieces and all(len(p) == length for p in f_pieces)
+                f_lex[i][j] = min(f_pieces)
+            if c_best[i][j] != _NEG:
+                assert c_pieces and all(len(p) == length for p in c_pieces)
+                c_lex[i][j] = min(c_pieces)
+            if nb_best[i][j] != _NEG:
+                assert nb_pieces and all(len(p) == length for p in nb_pieces)
+                nb_lex[i][j] = min(nb_pieces)
 
-    # Pairs appearing in at least one global optimum: propagate reachability
-    # of intervals along optimal decisions from the root [0, n).
-    reachable = [[False] * (n + 1) for _ in range(n + 1)]
-    reachable[0][n] = True
-    can_pair: set[Tuple[int, int]] = set()
+    def propagate_table(
+        i: int,
+        j: int,
+        target: int,
+        t_filter: str,
+    ) -> None:
+        """Mark subintervals/pairs used by one optimal decision of [i, j)."""
+        if (
+            t_filter != "last"
+            and partner[i] == -1
+            and closed[i + 1][j]
+            and up_scores[i] + f_best[i + 1][j] == target
+        ):
+            f_reach[i + 1][j] = True
 
+        for t in range(i + MIN_HAIRPIN + 1, j):
+            if not pair_allowed(i, t) or not closed[t + 1][j]:
+                continue
+            if t_filter == "last" and t != j - 1:
+                continue
+            if t_filter == "notlast" and t == j - 1:
+                continue
+            s_out = f_best[t + 1][j]
+            if s_out == _NEG:
+                continue
+            pair_w = PAIR_SCORES[(seq[i], seq[t])]
+            in_best = max(
+                stack + c_best[i + 1][t],
+                nb_best[i + 1][t],
+            )
+            v = pair_w + in_best + s_out
+            if v != target:
+                continue
+            can_pair.add((i, t))
+            f_reach[t + 1][j] = True
+            for in_val, kind in interior_options(i, t):
+                if in_val != in_best:
+                    continue
+                if kind == "c":
+                    c_reach[i + 1][t] = True
+                else:
+                    nb_reach[i + 1][t] = True
+
+    # One descending pass over all three boundary states.  Every marked
+    # subinterval is strictly shorter, so it is visited later in this same
+    # loop regardless of which table marked it.
     for length in range(n, 0, -1):
         for i in range(0, n - length + 1):
             j = i + length
-            if not reachable[i][j]:
-                continue
-            target = best[i][j]
-
-            # Feasibility is tracked by best != _NEG only.  ways is reduced
-            # modulo MOD and may legitimately be 0 for a non-empty set of
-            # structures, so it must never gate reachability: otherwise a
-            # pair appearing only behind a count that is 0 mod MOD would be
-            # wrongly omitted.
-            if (
-                partner[i] == -1
-                and closed[i + 1][j]
-                and best[i + 1][j] == target
-            ):
-                reachable[i + 1][j] = True
-
-            for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
-                    continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
-                    continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                if v != target:
-                    continue
-                can_pair.add((i, t))
-                reachable[i + 1][t] = True
-                reachable[t + 1][j] = True
+            if f_reach[i][j]:
+                propagate_table(i, j, f_best[i][j], "all")
+            if nb_reach[i][j]:
+                propagate_table(i, j, nb_best[i][j], "notlast")
+            if c_reach[i][j]:
+                propagate_table(i, j, c_best[i][j], "last")
 
     return {
-        "score": best[0][n],
-        "structure": lex[0][n],
-        "count": ways[0][n],
+        "score": f_best[0][n],
+        "structure": f_lex[0][n],
+        "count": f_ways[0][n],
         "pairs": tuple(sorted(can_pair)),
     }

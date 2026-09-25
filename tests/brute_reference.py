@@ -27,7 +27,10 @@ Structure = Tuple[int, str, FrozenSet[Tuple[int, int]]]
 
 
 def _enumerate(
-    seq: str, force_unpaired: List[bool]
+    seq: str,
+    force_unpaired: List[bool],
+    unpaired_scores: List[int],
+    stack_score: int,
 ) -> List[Structure]:
     """All legal non-crossing matchings, without forced-pair filtering."""
     n = len(seq)
@@ -45,7 +48,7 @@ def _enumerate(
         # Branch A: i unpaired (always legal; when i is forced unpaired it
         # is the only branch taken).
         for sc, s, pr in go(i + 1, j):
-            out.append((sc, "." + s, pr))
+            out.append((sc + unpaired_scores[i], "." + s, pr))
 
         # Branch B: i paired with t.
         for t in range(i + MIN_HAIRPIN + 1, j):
@@ -56,9 +59,14 @@ def _enumerate(
                 continue
             for sc1, s1, p1 in go(i + 1, t):
                 for sc2, s2, p2 in go(t + 1, j):
+                    bonus = (
+                        stack_score
+                        if (i + 1, t - 1) in p1
+                        else 0
+                    )
                     out.append(
                         (
-                            w + sc1 + sc2,
+                            w + bonus + sc1 + sc2,
                             "(" + s1 + ")" + s2,
                             p1 | p2 | frozenset(((i, t),)),
                         )
@@ -74,6 +82,8 @@ def brute_force(
     seq: str,
     forced_pairs: Optional[FrozenSet[Tuple[int, int]]] = None,
     forced_unpaired: Optional[frozenset] = None,
+    unpaired_scores: Optional[List[int]] = None,
+    stack_score: int = 0,
 ) -> Dict[str, object]:
     """Exact reference optimum over structures satisfying all constraints.
 
@@ -85,6 +95,8 @@ def brute_force(
     forced_unpaired = forced_unpaired or frozenset()
     n = len(seq)
     up = [p in forced_unpaired for p in range(n)]
+    if unpaired_scores is None:
+        unpaired_scores = [0] * n
 
     required: Dict[int, int] = {}
     for a, b in forced_pairs:
@@ -96,7 +108,7 @@ def brute_force(
     exact_count = 0
     all_pairs: set = set()
 
-    for sc, s, pr in _enumerate(seq, up):
+    for sc, s, pr in _enumerate(seq, up, unpaired_scores, stack_score):
         ok = all(p in pr for p in forced_pairs)
         if not ok:
             continue

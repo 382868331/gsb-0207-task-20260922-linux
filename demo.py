@@ -16,17 +16,20 @@ from rna_fold import (
     ConstraintError,
     InvalidSequenceError,
     fold,
+    score_structure,
 )
 
 
-def _print_result(title, sequence, constraints=None):
+def _print_result(title, sequence, constraints=None, **scoring):
     print("=" * 64)
     print(title)
     print(f"sequence    : {sequence}  (n={len(sequence)})")
     if constraints is not None:
         print(f"constraints : {constraints!r}")
+    if scoring:
+        print(f"scoring     : {scoring!r}")
     t0 = time.perf_counter()
-    result = fold(sequence, constraints)
+    result = fold(sequence, constraints, **scoring)
     dt = time.perf_counter() - t0
     print(f"structure   : {result['structure']}")
     print(f"score       : {result['score']}")
@@ -57,6 +60,40 @@ def main() -> None:
     )
     assert (0, 14) in res2["pairs"]
 
+    # --- 2b. Adjacent nesting bonus changes the optimum -----------------
+    # GGAACUU (n=7): a lone GC pair (0,4) scores 3; the directly nested
+    # pair of weak GU pairs (0,6)+(1,5) scores only 1+1 by itself, but a
+    # stack bonus of 3 makes 1+1+3=5 and flips the optimum.  This is a
+    # synthetic discrete scoring rule, NOT a real RNA free-energy model.
+    seq_b = "GGAACUU"
+    res_no = _print_result(
+        "2b) No stack bonus (stack_score=0): lone GC wins",
+        seq_b,
+        stack_score=0,
+    )
+    assert res_no["structure"] == "(...).."
+    res_b = _print_result(
+        "2b) Adjacent nesting bonus stack_score=3: nested GU pair wins",
+        seq_b,
+        stack_score=3,
+    )
+    assert res_b["structure"] == "((...))"
+    assert res_b["score"] == 1 + 1 + 3
+    # Independent rescoring of the returned dot-bracket agrees.
+    assert (
+        score_structure(seq_b, res_b["structure"], stack_score=3)
+        == res_b["score"]
+    )
+
+    # --- 2c. Per-position unpaired payoff -------------------------------
+    # Paying position 0 to stay single changes whether it pairs.
+    res_c = _print_result(
+        "2c) Unpaired payoff unpaired_scores=[5,0,...]: position 0 stays open",
+        seq_b,
+        unpaired_scores=[5, 0, 0, 0, 0, 0, 0],
+    )
+    assert res_c["structure"][0] == "."
+
     # --- 3. Actual rejection: conflicting hard constraints ---------------
     # (0,9)=G-C and (4,13)=A-U are each individually legal, but they cross
     # (0 < 4 < 9 < 13): a pseudoknot, rejected up front with locations.
@@ -85,7 +122,8 @@ def main() -> None:
         raise AssertionError("expected an InvalidSequenceError")
 
     print("=" * 64)
-    print("demo finished: 2 successful folds and 2 live rejections.")
+    print("demo finished: successful folds (incl. stack/unpaired scoring) "
+          "and 2 live rejections.")
 
 
 if __name__ == "__main__":
