@@ -1,4 +1,4 @@
-"""RNA secondary structure prediction with forced pairings.
+"""RNA secondary structure prediction with forced pairings and extra scores.
 
 Single public entry point: :func:`fold`.
 
@@ -7,6 +7,14 @@ dynamic program.  It performs an exhaustive search over every admissible
 structure -- it never samples -- so a returned optimum is proven optimal and a
 rejected constraint set is proven unsatisfiable.  See README.md for the full
 contract.
+
+Scoring (all integer, all optional additions default to zero):
+
+* per-base-pair scores (GC=3, AU=2, GU=1);
+* per-position unpaired scores (each unpaired position contributes its own
+  configured integer value);
+* a stacking bonus added once for every directly nested adjacent pair
+  (i, j) + (i+1, j-1) present in the structure.
 """
 
 from __future__ import annotations
@@ -301,6 +309,45 @@ def _normalise_constraints(
     return partner, force_up
 
 
+def _normalise_unpaired_scores(value: object, n: int) -> List[int]:
+    """Validate the per-position unpaired score table.
+
+    Accepts None (all zero), a sequence of exactly n integers, or a mapping
+    {position: score}; positions absent from the mapping default to 0.
+    """
+    if value is None:
+        return [0] * n
+    if isinstance(value, Mapping):
+        scores = [0] * n
+        for key, val in value.items():
+            p = _as_int(key, "unpaired_scores: key")
+            if not 0 <= p < n:
+                raise ValueError(
+                    f"unpaired_scores: position {p} out of range "
+                    f"[0, {n - 1}]"
+                )
+            scores[p] = _as_int(val, f"unpaired_scores[{p}]")
+        return scores
+    if isinstance(value, (str, bytes)):
+        raise TypeError(
+            "unpaired_scores: expected a sequence of n integers or a "
+            f"mapping, got {type(value).__name__}"
+        )
+    try:
+        items = list(value)  # type: ignore[call-overload]
+    except TypeError:
+        raise TypeError(
+            "unpaired_scores: expected a sequence of n integers or a "
+            f"mapping, got {type(value).__name__}"
+        ) from None
+    if len(items) != n:
+        raise ValueError(
+            f"unpaired_scores: expected {n} entries (one per position), "
+            f"got {len(items)}"
+        )
+    return [_as_int(v, f"unpaired_scores[{i}]") for i, v in enumerate(items)]
+
+
 # ---------------------------------------------------------------------------
 # Core dynamic program
 # ---------------------------------------------------------------------------
@@ -309,6 +356,9 @@ def _normalise_constraints(
 def fold(
     sequence: str,
     constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+    *,
+    unpaired_scores: "Optional[Iterable[int] | Mapping[int, int]]" = None,
+    stack_score: int = 0,
 ) -> Dict[str, object]:
     """Fold ``sequence`` into a maximum-score non-crossing secondary structure.
 
@@ -324,9 +374,17 @@ def fold(
 
         Forced pairs must be complementary, satisfy ``j - i >= 4``, share no
         endpoint, and not cross.
+    :param unpaired_scores: optional per-position integer score awarded when
+        that position stays unpaired.  Either a sequence of exactly
+        ``len(sequence)`` integers or a mapping ``{position: score}``
+        (missing positions default to 0).  Defaults to all zero.
+    :param stack_score: integer bonus added once for every directly nested
+        adjacent pair: both ``(i, j)`` and ``(i+1, j-1)`` present in the
+        structure.  May be negative (a penalty).  Defaults to 0.
     :returns: dict with
 
-        * ``score`` (int): maximum total score (GC=3, AU=2, GU=1);
+        * ``score`` (int): maximum total score (pair scores + unpaired
+          scores + stacking bonuses);
         * ``structure`` (str): lexicographically smallest dot-bracket string
           among all maximum-score structures (ASCII order, so ``'(' < ')' <
           '.'``);
@@ -336,6 +394,8 @@ def fold(
           least one* maximum-score structure, sorted.
     :raises TypeError: wrong value types (including ``bool`` as int).
     :raises InvalidSequenceError: bad length or illegal character.
+    :raises ValueError: malformed ``unpaired_scores`` (bad length, position
+        out of range, non-integer entry).
     :raises ConstraintError: malformed or conflicting constraints.
     :raises UnsatisfiableConstraintError: proven that no admissible structure
         satisfies the forced constraints.
@@ -343,6 +403,8 @@ def fold(
     seq = _validate_sequence(sequence)
     partner, force_up = _normalise_constraints(constraints, seq)
     n = len(seq)
+    up = _normalise_unpaired_scores(unpaired_scores, n)
+    stack = _as_int(stack_score, "stack_score")
 
     # A *closed* interval [i, j) is one where every position p in [i, j)
     # with a forced mate also has that mate inside [i, j).  The DP only
@@ -378,22 +440,45 @@ def fold(
             return False
         return True
 
-    # Half-open intervals [i, j), 0 <= i <= j <= n.
+    # Half-open intervals [i, j), 0 <= i <= j <= n.  Two score tables are
+    # needed because the stacking bonus depends on whether the interval is
+    # directly enclosed by a pair:
+    #
+    #   B[i][j]: best score of [i, j) with no enclosing pair (top level or
+    #            the region after a pair's right endpoint).
+    #   E[i][j]: best score of [i, j) given it is directly enclosed by the
+    #            pair (i-1, j); choosing the pair (i, j-1) here forms the
+    #            adjacent nested stack (i-1, j)+(i, j-1) and earns the bonus.
+    #            Once position i stays unpaired, or i pairs with some
+    #            t < j-1, nothing inside the remainder can be adjacent to
+    #            the enclosing pair any more, so those remainders fall back
+    #            to the B table.
+    #
+    # The decomposition is canonical (always peel the leftmost position of
+    # the interval), so every structure corresponds to exactly one
+    # decomposition path and is counted exactly once.
     best: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
+    enc: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
     ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
+    enc_ways: List[List[int]] = [[0] * (n + 1) for _ in range(n + 1)]
     for i in range(n + 1):
         ways[i][i] = 1
+        enc_ways[i][i] = 1
 
     for length in range(1, n + 1):
         for i in range(0, n - length + 1):
             j = i + length
+
+            # --- E[i][j]: interval enclosed by the pair (i-1, j) ---------
             top = _NEG
             total = 0
 
             # Option 1: position i stays unpaired (impossible if its mate is
-            # forced, or if its mate would be stranded outside the remainder).
+            # forced, or if its mate would be stranded outside the
+            # remainder).  The enclosing pair can no longer stack with
+            # anything inside, so the remainder is a plain B interval.
             if partner[i] == -1 and closed[i + 1][j]:
-                v = best[i + 1][j]
+                v = up[i] + best[i + 1][j]
                 w = ways[i + 1][j]
                 if v > top:
                     top, total = v, w
@@ -406,12 +491,46 @@ def fold(
                     continue
                 if not closed[i + 1][t] or not closed[t + 1][j]:
                     continue
-                s_in = best[i + 1][t]
+                s_in = enc[i + 1][t]
+                s_out = best[t + 1][j]
+                if s_in == _NEG or s_out == _NEG:
+                    continue
+                # The pair (i, j-1) sits directly inside the enclosing pair
+                # (i-1, j): exactly the adjacent nested configuration.
+                bonus = stack if t == j - 1 else 0
+                v = PAIR_SCORES[(seq[i], seq[t])] + bonus + s_in + s_out
+                w = (enc_ways[i + 1][t] * ways[t + 1][j]) % MOD
+                if v > top:
+                    top, total = v, w
+                elif v == top:
+                    total = (total + w) % MOD
+
+            enc[i][j] = top
+            enc_ways[i][j] = total
+
+            # --- B[i][j]: no enclosing pair ------------------------------
+            top = _NEG
+            total = 0
+
+            if partner[i] == -1 and closed[i + 1][j]:
+                v = up[i] + best[i + 1][j]
+                w = ways[i + 1][j]
+                if v > top:
+                    top, total = v, w
+                elif v == top:
+                    total = (total + w) % MOD
+
+            for t in range(i + MIN_HAIRPIN + 1, j):
+                if not pair_allowed(i, t):
+                    continue
+                if not closed[i + 1][t] or not closed[t + 1][j]:
+                    continue
+                s_in = enc[i + 1][t]
                 s_out = best[t + 1][j]
                 if s_in == _NEG or s_out == _NEG:
                     continue
                 v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                w = (ways[i + 1][t] * ways[t + 1][j]) % MOD
+                w = (enc_ways[i + 1][t] * ways[t + 1][j]) % MOD
                 if v > top:
                     top, total = v, w
                 elif v == top:
@@ -428,84 +547,99 @@ def fold(
 
     # Lexicographically smallest optimal structure per interval.
     lex: List[List[str]] = [[""] * (n + 1) for _ in range(n + 1)]
+    enc_lex: List[List[str]] = [[""] * (n + 1) for _ in range(n + 1)]
     for length in range(1, n + 1):
         for i in range(0, n - length + 1):
             j = i + length
-            if best[i][j] == _NEG:
-                continue  # infeasible interval: no witness string
-            target = best[i][j]
-            chosen: Optional[str] = None
-
-            if (
-                partner[i] == -1
-                and closed[i + 1][j]
-                and best[i + 1][j] == target
+            # (table, lex_table, rest_table, rest_lex, is_enc): an enclosed
+            # interval falls back to the plain B tables for its unpaired and
+            # after-pair remainders (see the DP comment above).
+            for table, lex_table, rest, rest_lex, is_enc in (
+                (enc, enc_lex, best, lex, True),
+                (best, lex, best, lex, False),
             ):
-                chosen = "." + lex[i + 1][j]
+                if table[i][j] == _NEG:
+                    continue  # infeasible interval: no witness string
+                target = table[i][j]
+                chosen: Optional[str] = None
 
-            for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
-                    continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
-                    continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                if v != target:
-                    continue
-                candidate = (
-                    "(" + lex[i + 1][t] + ")" + lex[t + 1][j]
-                )
-                if chosen is None or candidate < chosen:
-                    chosen = candidate
+                if (
+                    partner[i] == -1
+                    and closed[i + 1][j]
+                    and up[i] + rest[i + 1][j] == target
+                ):
+                    chosen = "." + rest_lex[i + 1][j]
 
-            # Feasible intervals always have a witness (root is feasible and
-            # table values are maxima over enumerated options).
-            assert chosen is not None and len(chosen) == length
-            lex[i][j] = chosen
+                for t in range(i + MIN_HAIRPIN + 1, j):
+                    if not pair_allowed(i, t):
+                        continue
+                    if not closed[i + 1][t] or not closed[t + 1][j]:
+                        continue
+                    s_in = enc[i + 1][t]
+                    s_out = rest[t + 1][j]
+                    if s_in == _NEG or s_out == _NEG:
+                        continue
+                    bonus = stack if (is_enc and t == j - 1) else 0
+                    v = PAIR_SCORES[(seq[i], seq[t])] + bonus + s_in + s_out
+                    if v != target:
+                        continue
+                    candidate = (
+                        "(" + enc_lex[i + 1][t] + ")" + rest_lex[t + 1][j]
+                    )
+                    if chosen is None or candidate < chosen:
+                        chosen = candidate
+
+                # Feasible intervals always have a witness (root is feasible
+                # and table values are maxima over enumerated options).
+                assert chosen is not None and len(chosen) == length
+                lex_table[i][j] = chosen
 
     # Pairs appearing in at least one global optimum: propagate reachability
     # of intervals along optimal decisions from the root [0, n).
     reachable = [[False] * (n + 1) for _ in range(n + 1)]
+    enc_reachable = [[False] * (n + 1) for _ in range(n + 1)]
     reachable[0][n] = True
     can_pair: set[Tuple[int, int]] = set()
 
     for length in range(n, 0, -1):
         for i in range(0, n - length + 1):
             j = i + length
-            if not reachable[i][j]:
-                continue
-            target = best[i][j]
-
-            # Feasibility is tracked by best != _NEG only.  ways is reduced
-            # modulo MOD and may legitimately be 0 for a non-empty set of
-            # structures, so it must never gate reachability: otherwise a
-            # pair appearing only behind a count that is 0 mod MOD would be
-            # wrongly omitted.
-            if (
-                partner[i] == -1
-                and closed[i + 1][j]
-                and best[i + 1][j] == target
+            for table, reach, rest, rest_reach, is_enc in (
+                (enc, enc_reachable, best, reachable, True),
+                (best, reachable, best, reachable, False),
             ):
-                reachable[i + 1][j] = True
+                if not reach[i][j]:
+                    continue
+                target = table[i][j]
 
-            for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
-                    continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
-                    continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                if v != target:
-                    continue
-                can_pair.add((i, t))
-                reachable[i + 1][t] = True
-                reachable[t + 1][j] = True
+                # Feasibility is tracked by table != _NEG only.  The ways
+                # counters are reduced modulo MOD and may legitimately be 0
+                # for a non-empty set of structures, so they must never gate
+                # reachability: otherwise a pair appearing only behind a
+                # count that is 0 mod MOD would be wrongly omitted.
+                if (
+                    partner[i] == -1
+                    and closed[i + 1][j]
+                    and up[i] + rest[i + 1][j] == target
+                ):
+                    rest_reach[i + 1][j] = True
+
+                for t in range(i + MIN_HAIRPIN + 1, j):
+                    if not pair_allowed(i, t):
+                        continue
+                    if not closed[i + 1][t] or not closed[t + 1][j]:
+                        continue
+                    s_in = enc[i + 1][t]
+                    s_out = rest[t + 1][j]
+                    if s_in == _NEG or s_out == _NEG:
+                        continue
+                    bonus = stack if (is_enc and t == j - 1) else 0
+                    v = PAIR_SCORES[(seq[i], seq[t])] + bonus + s_in + s_out
+                    if v != target:
+                        continue
+                    can_pair.add((i, t))
+                    enc_reachable[i + 1][t] = True
+                    rest_reach[t + 1][j] = True
 
     return {
         "score": best[0][n],

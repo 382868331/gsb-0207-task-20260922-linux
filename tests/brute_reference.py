@@ -74,17 +74,22 @@ def brute_force(
     seq: str,
     forced_pairs: Optional[FrozenSet[Tuple[int, int]]] = None,
     forced_unpaired: Optional[frozenset] = None,
+    unpaired_scores: Optional[List[int]] = None,
+    stack_score: int = 0,
 ) -> Dict[str, object]:
     """Exact reference optimum over structures satisfying all constraints.
 
     Forced pairs are enforced by *post-filtering* independently enumerated
     matchings, a deliberately different mechanism from the production code's
-    closed-interval DP.
+    closed-interval DP.  Unpaired-position scores and the adjacent nested
+    stacking bonus are likewise computed per enumerated structure, directly
+    from its pair set and dot-bracket string.
     """
     forced_pairs = forced_pairs or frozenset()
     forced_unpaired = forced_unpaired or frozenset()
     n = len(seq)
     up = [p in forced_unpaired for p in range(n)]
+    ups = unpaired_scores if unpaired_scores is not None else [0] * n
 
     required: Dict[int, int] = {}
     for a, b in forced_pairs:
@@ -100,6 +105,16 @@ def brute_force(
         ok = all(p in pr for p in forced_pairs)
         if not ok:
             continue
+        # Extra per-structure scoring, derived independently of the DP:
+        # unpaired positions contribute their configured integer score, and
+        # every directly nested adjacent pair (i, j)+(i+1, j-1) contributes
+        # the stacking bonus exactly once.
+        for p, ch in enumerate(s):
+            if ch == ".":
+                sc += ups[p]
+        for a, b in pr:
+            if (a + 1, b - 1) in pr:
+                sc += stack_score
         exact_count += 1
         if best_score is None or sc > best_score:
             best_score = sc
