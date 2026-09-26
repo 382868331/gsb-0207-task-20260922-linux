@@ -1,14 +1,26 @@
-# RNA 二级结构预测（带强制配对）
+# RNA 二级结构预测（带强制配对 + 可选单 H 型假结）
 
 离线、纯标准库实现的「带强制配对的 RNA 非交叉（无假结）二级结构预测」可复用模块。
 核心算法为**精确区间动态规划**，穷举所有合法结构求最优，**不做任何伪随机抽样**；
 约束冲突在输入校验阶段直接拒绝。
+本次迭代新增**可选的单 H 型假结模式**：调用方给定假结罚分后，搜索空间额外允许
+「恰好一个 H 型假结」（两条连续嵌套茎交叉，端点交错 i<k<j<l），无假结结构仍始终
+作为候选；详见下文「单 H 型假结模式」。
 
 ## 环境与依赖
 
 - Python **3.14.7**（3.10+ 的类型语法即可运行，目标环境为 3.14.7）
 - **仅使用 Python 标准库**，安装 Python 后无需安装任何第三方依赖
 - 完全离线：不需要网络、账号、密钥、数据库、中间件、云 API 或 Docker
+
+### 准备虚拟环境（可选，非必需）
+
+模块不依赖任何第三方包，系统 Python 即可直接运行；如需隔离环境：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate   # 之后 python 即指向 .venv 内的解释器
+```
 
 ## 快速运行
 
@@ -20,10 +32,14 @@ python -m unittest discover -s tests -v
 
 # 运行固定输入演示：2 个真实计算结果 + 2 个真实触发的拒绝
 python demo.py
+
+# 运行本次迭代演示：单 H 型假结 + 罚分回退/长度上限边界
+python demo_iteration.py
 ```
 
 `python demo.py` 在普通笔记本上约 0.02 秒完成（远低于 8 秒预算），所有结果都是
 当场由算法真实计算得到，不使用 `sleep`，也不预录输出。
+`python demo_iteration.py` 同样为毫秒级（远低于 90 秒预算）。
 
 ## 公共接口
 
@@ -31,6 +47,7 @@ python demo.py
 from rna_fold import fold
 
 result = fold(sequence, constraints=None)
+result_pk = fold(sequence, constraints=None, pseudoknot_penalty=5)
 ```
 
 ### 参数
@@ -55,14 +72,51 @@ result = fold(sequence, constraints=None)
 | `structure` | `str` | 最优结构中**字典序最小**的 dot-bracket（`(`、`)`、`.`） |
 | `count` | `int` | 最优结构数量，模 **1 000 000 007** |
 | `pairs` | `tuple[(i, j), ...]` | **所有至少出现在某个最优结构中**的配对，按 `(i,j)` 升序 |
+| `pseudoknot` | `None` 或 `dict` | **仅当传入 `pseudoknot_penalty` 时存在**；见下节 |
 
 字典序按 ASCII 码比较，即 `'(' < ')' < '.'`。
+
+## 单 H 型假结模式（本次迭代新增）
+
+传入可选关键字参数 `pseudoknot_penalty`（整数，可以为 0 或负数，按原样从总分中
+**减去一次**）即开启假结模式；不传（`None`）时行为与旧版本完全一致。
+
+- **拓扑**：在原有全部无假结结构之外，额外允许「恰好一个 H 型假结」——两条茎
+  交叉，端点交错 `i < k < j < l`；每条茎由**连续嵌套**配对组成
+  （`(i,j), (i+1,j-1), ...`，长度 >= 1）。两条茎之间与两侧的三个内部区段、以及
+  假结块之外（允许配对**包住**整个假结块）仍按原无假结精确 DP 折叠。
+  **最多一个**这样的结构：任何需要两个及以上假结的任意交叉网都不在搜索空间内。
+- **目标**：原配对分值之和，若为假结结构再减去一次 `pseudoknot_penalty`。
+  无假结结构始终是候选，因此罚分足够大时最优解自动退回原结构。
+- **约束**：配对合法性（六种碱基对、`j - i >= 4`）、强制配对、强制未配继续有效，
+  每个位置仍只能使用一次；强制配对本身仍不得互相交叉（交叉的强制配对照旧在输入
+  校验阶段拒绝）。强制配对可以落在茎上、任一区段内、或包住整个假结块。
+- **长度上限**：该模式下 `n <= 24`（`MAX_PSEUDOKNOT_SEQUENCE_LENGTH`），超出抛
+  `InvalidSequenceError`；不传罚分时上限仍为 120。
+- **返回值**：在原有四个键之外增加 `pseudoknot` 键——
+  - 最优报告结构不含假结时为 `None`；
+  - 否则为 `{"stem1": ((i, j), ...), "stem2": ((i, j), ...), "penalty": p}`，
+    两条交叉茎各自的所有配对（`stem1` 为靠 5' 侧的茎，即 `()` 标记的那条）。
+  - `structure` 字符串中第二条茎用 `[]` 标记（第一条茎与其余配对用 `()`），
+    `pairs`/`count`/`score` 语义不变（`pairs` 含两条茎的全部配对）。
+
+```python
+>>> from rna_fold import fold
+>>> r = fold("GGGAAGGGACCCAACCC", pseudoknot_penalty=2)
+>>> r["structure"]
+'(((..[[[.)))..]]]'
+>>> r["pseudoknot"]
+{'stem1': ((0, 11), (1, 10), (2, 9)), 'stem2': ((5, 16), (6, 15), (7, 14)), 'penalty': 2}
+>>> fold("GGGAAGGGACCCAACCC", pseudoknot_penalty=50)["pseudoknot"] is None
+True  # 罚分太大，最优退回无假结结构
+```
 
 ### 合法结构规则（题面契约）
 
 - 只允许 `AU, UA, GC, CG, GU, UG` 六种配对；
 - 每对内部至少 **3 个未配位点**：`j - i >= 4`（最小发夹环为 3 nt）；
-- 禁止交叉（无假结），每个位置最多参与一个配对。
+- 默认禁止交叉（无假结）；开启假结模式后允许至多一个上述 H 型假结；
+  每个位置最多参与一个配对。
 
 ## 错误语义（异常层级）
 
@@ -70,6 +124,7 @@ result = fold(sequence, constraints=None)
 **不静默纠正、不猜测**。`fold` 是纯函数，失败不修改入参，不存在部分变更。
 
 - `rna_fold.InvalidSequenceError(ValueError)`：序列类型错误、长度超 120、非法字符。
+  假结模式下长度超 24 也抛此异常。
 - `rna_fold.ConstraintError(ValueError)`：约束**结构性**非法：
   - 类型错误、下标越界、整数位置传入 `bool`/`NaN`/`Infinity`/非整数浮点；
   - 字符串约束长度不符、括号不配平、含非法字符；
@@ -87,6 +142,7 @@ result = fold(sequence, constraints=None)
 
 数值输入契约：整数参数拒绝 `bool`（`True/False` 不当作 1/0）；`float` 的
 `NaN`/`Infinity` 分别按名称拒绝，其他非整数浮点报 `TypeError`。
+`pseudoknot_penalty` 遵循同一契约（拒绝 `bool`/`NaN`/`Infinity`/非整数浮点）。
 
 ## 算法与设计取舍
 
@@ -107,6 +163,15 @@ result = fold(sequence, constraints=None)
   可达性只由分值表（可行性）决定，**不使用取模后的计数**，因此即使某子结构
   集合数量恰为模数倍数（计数显示 0），配对集合仍然精确。测试
   `test_pair_set_independent_of_count_modulus` 用小模数白盒验证了这一点。
+- **单 H 型假结**：核心 DP 抽为 `_solve(seq, partner, force_up, orig_pos)`，
+  对「主序列」与「假结块外拼接序列」复用同一实现。枚举所有合法茎
+  （连续嵌套、逐对过 `pair_allowed`），再枚举端点交错 `i<k<j<l` 的茎对；
+  茎间三个区段直接查主 DP 表，假结块 `[lo1, hi2]` 之外的位置拼成
+  `seq[:lo1] + seq[hi2+1:]` 单独跑一次 `_solve`（于是外部配对可以**包住**整个
+  假结块；`orig_pos` 保证最小发夹跨度按原始坐标度量）。强制配对用位掩码记账：
+  落在茎上、某一区段内、或完全在假结块外才算被覆盖，否则该拓扑不可行。
+  计数按「区段计数乘积」、跨拓扑求和；不同拓扑产生的配对集合互不相同，
+  不会重复计数。n=24 时全部耗时约 0.05 秒。
 
 ### 与独立参考的关系
 
@@ -115,6 +180,12 @@ result = fold(sequence, constraints=None)
 结构（与生产代码的闭区间 DP 是两套独立机制），独立给出最大分、字典序最小串、
 精确最优数量与最优配对集合。测试在数百个确定性随机序列（固定种子）上逐字段对拍。
 往返一致性（返回串自身合法、能达到所报分值）仅作为补充断言。
+
+`tests/brute_pk_reference.py` 是假结模式的独立参考：同样不导入被测模块，
+按位掩码递归枚举 n ≤ 14 的**全部**匹配（任意拓扑），再逐个判定拓扑是否属于
+「无交叉 或 恰好一个 H 型假结」（交叉对必须构成两条连续嵌套茎且端点交错），
+假结结构减去罚分后取最优。`tests/test_pseudoknot.py` 在固定种子的随机序列、
+强制约束组合与手工构造的「双假结诱惑」序列上与生产实现对拍。
 
 ## 数值/误差口径
 
@@ -129,7 +200,9 @@ result = fold(sequence, constraints=None)
 - 这是题面定义的**简化打分模型**，不是完整 RNA 折叠能量模型（无最近邻能量、
   无温度、无自由能 kcal/mol、无堆栈/凸包/多分支环能量项），不与 ViennaRNA 等
   行业标准兼容。
-- 禁止假结（非交叉）；不预测三链、修饰碱基、非 `ACGU` 字母（如 N、I）。
+- 默认禁止假结；可选假结模式仅支持**至多一个 H 型假结**（两条连续嵌套茎交叉），
+  不支持任意交叉网、不支持两个及以上假结，且该模式限长 24。
+  不预测三链、修饰碱基、非 `ACGU` 字母（如 N、I）。
 - 只输出单一字典序最小最优结构；其余并列最优结构以 `count` 与 `pairs` 概括，
   不逐个枚举（n=120 时枚举全部结构不现实）。
 - `BudgetExceededError` 在当前确定性 DP 下不会被抛出；它是为语义完整性保留的
@@ -140,7 +213,10 @@ result = fold(sequence, constraints=None)
 ```
 rna_fold.py            # 核心模块：fold() 与公开异常/常量
 demo.py                # 固定输入演示（真实计算 + 真实拒绝）
+demo_iteration.py      # 本次迭代演示：单 H 型假结 + 边界情况
 tests/test_fold.py     # 必要测试（对拍、约束、GU、并列最优、非法输入等）
+tests/test_pseudoknot.py  # 假结模式测试（对拍、罚分回退、非法第二假结等）
 tests/brute_reference.py  # 独立穷举参考（n<=14，不调用被测核心）
+tests/brute_pk_reference.py  # 假结模式独立穷举参考（n<=14，不调用被测核心）
 README.md
 ```
