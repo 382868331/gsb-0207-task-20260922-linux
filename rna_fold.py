@@ -1,6 +1,6 @@
 """RNA secondary structure prediction with forced pairings.
 
-Single public entry point: :func:`fold`.
+Public entry points: :func:`fold` and :func:`fold_batch`.
 
 The implementation is an exact, non-crossing (pseudoknot-free) interval
 dynamic program.  It performs an exhaustive search over every admissible
@@ -11,17 +11,25 @@ contract.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import heapq
+import hmac
+import json
 import math
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 __all__ = [
     "fold",
+    "fold_batch",
     "InvalidSequenceError",
     "ConstraintError",
     "UnsatisfiableConstraintError",
     "BudgetExceededError",
+    "InvalidCursorError",
     "MIN_HAIRPIN",
     "MAX_SEQUENCE_LENGTH",
+    "MAX_BATCH_SIZE",
     "PAIR_SCORES",
     "MOD",
 ]
@@ -30,6 +38,8 @@ MIN_HAIRPIN = 3
 """Minimum number of *unpaired* positions inside a pair (j - i >= 4)."""
 
 MAX_SEQUENCE_LENGTH = 120
+
+MAX_BATCH_SIZE = 1000
 
 MOD = 1_000_000_007
 
@@ -81,6 +91,10 @@ class BudgetExceededError(RuntimeError):
     "budget exhausted" permanently distinct from
     :class:`UnsatisfiableConstraintError` ("proven no solution").
     """
+
+
+class InvalidCursorError(ValueError):
+    """A batch continuation cursor is malformed or belongs to another input."""
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +320,7 @@ def _normalise_constraints(
 # ---------------------------------------------------------------------------
 
 
-def fold(
+def _compute_fold(
     sequence: str,
     constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
 ) -> Dict[str, object]:
@@ -512,4 +526,263 @@ def fold(
         "structure": lex[0][n],
         "count": ways[0][n],
         "pairs": tuple(sorted(can_pair)),
+        "_model": {
+            "sequence": seq,
+            "partner": partner,
+            "force_up": force_up,
+            "closed": closed,
+            "best": best,
+            "ways": ways,
+            "lex": lex,
+        },
+    }
+
+
+def fold(
+    sequence: str,
+    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+) -> Dict[str, object]:
+    result = _compute_fold(sequence, constraints)
+    return {
+        "score": result["score"],
+        "structure": result["structure"],
+        "count": result["count"],
+        "pairs": result["pairs"],
+    }
+
+
+def _structure_pairs(structure: str) -> Tuple[Tuple[int, int], ...]:
+    stack: List[int] = []
+    pairs: List[Tuple[int, int]] = []
+    for i, ch in enumerate(structure):
+        if ch == "(":
+            stack.append(i)
+        elif ch == ")":
+            pairs.append((stack.pop(), i))
+    return tuple(pairs)
+
+
+def _input_fingerprint(
+    sequence: str,
+    partner: List[int],
+    force_up: List[int],
+) -> str:
+    payload = json.dumps(
+        {
+            "sequence": sequence,
+            "partner": partner,
+            "force_up": force_up,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.blake2b(payload, digest_size=32).hexdigest()
+
+
+def _encode_cursor(offset: int, fingerprint: str) -> str:
+    payload = json.dumps(
+        {"v": 1, "offset": offset, "fingerprint": fingerprint},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signature = hashlib.blake2b(
+        payload, key=b"rna-fold-batch-cursor-v1", digest_size=32
+    ).digest()
+    return (
+        base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+        + "."
+        + base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+    )
+
+
+def _decode_cursor(cursor: object, expected_fingerprint: str) -> int:
+    if not isinstance(cursor, str):
+        raise InvalidCursorError(
+            f"cursor: expected str, got {type(cursor).__name__}"
+        )
+    parts = cursor.split(".")
+    if len(parts) != 2:
+        raise InvalidCursorError("cursor: malformed continuation token")
+    try:
+        payload_raw = base64.urlsafe_b64decode(
+            parts[0] + "=" * (-len(parts[0]) % 4)
+        )
+        signature = base64.urlsafe_b64decode(
+            parts[1] + "=" * (-len(parts[1]) % 4)
+        )
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InvalidCursorError("cursor: malformed continuation token") from exc
+
+    expected_signature = hashlib.blake2b(
+        payload_raw,
+        key=b"rna-fold-batch-cursor-v1",
+        digest_size=32,
+    ).digest()
+    if not hmac.compare_digest(signature, expected_signature):
+        raise InvalidCursorError("cursor: signature verification failed")
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        raise InvalidCursorError("cursor: unsupported cursor version")
+    if payload.get("fingerprint") != expected_fingerprint:
+        raise InvalidCursorError(
+            "cursor does not belong to this sequence and constraint set"
+        )
+    offset = payload.get("offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise InvalidCursorError("cursor: offset must be a non-negative integer")
+    return offset
+
+
+def _next_optimal_structure(
+    frontier: List[Tuple[str, int, str, Tuple[object, ...]]],
+    sequence: str,
+    model: Dict[str, object],
+) -> Optional[str]:
+    partner = model["partner"]
+    force_up = model["force_up"]
+    closed = model["closed"]
+    best = model["best"]
+    lex = model["lex"]
+
+    def pair_allowed(i: int, t: int) -> bool:
+        if force_up[i] or force_up[t]:
+            return False
+        if partner[i] != -1 and partner[i] != t:
+            return False
+        if partner[t] != -1 and partner[t] != i:
+            return False
+        return (sequence[i], sequence[t]) in PAIR_SCORES
+
+    def push(prefix: str, suffix: Tuple[object, ...], order: int) -> None:
+        minimum = [prefix]
+        for token in suffix:
+            if isinstance(token, str):
+                minimum.append(token)
+            else:
+                a, b = token
+                minimum.append(lex[a][b])
+        heapq.heappush(
+            frontier,
+            ("".join(minimum), order, prefix, suffix),
+        )
+
+    while frontier:
+        order = 0
+        _, _, prefix, suffix = heapq.heappop(frontier)
+        if not suffix:
+            return prefix
+
+        token = suffix[0]
+        rest = suffix[1:]
+        if isinstance(token, tuple):
+            i, j = token
+            if i >= j:
+                push(prefix, rest, order)
+                order += 1
+                continue
+        else:
+            push(prefix + token, rest, order)
+            order += 1
+            continue
+
+        target = best[i][j]
+
+        if (
+            partner[i] == -1
+            and closed[i + 1][j]
+            and best[i + 1][j] == target
+        ):
+            child_suffix = (".",)
+            if i + 1 < j:
+                child_suffix += ((i + 1, j),)
+            push(prefix, child_suffix + rest, order)
+            order += 1
+
+        for t in range(i + MIN_HAIRPIN + 1, j):
+            if not pair_allowed(i, t):
+                continue
+            if not closed[i + 1][t] or not closed[t + 1][j]:
+                continue
+            inside_score = best[i + 1][t]
+            outside_score = best[t + 1][j]
+            if inside_score == _NEG or outside_score == _NEG:
+                continue
+            value = (
+                PAIR_SCORES[(sequence[i], sequence[t])]
+                + inside_score
+                + outside_score
+            )
+            if value != target:
+                continue
+            child_suffix: Tuple[object, ...] = (
+                "(",
+                (i + 1, t),
+                ")",
+            )
+            if t + 1 < j:
+                child_suffix += ((t + 1, j),)
+            push(prefix, child_suffix + rest, order)
+            order += 1
+
+    return None
+
+
+def fold_batch(
+    sequence: str,
+    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+    batch_size: int = 10,
+    cursor: Optional[str] = None,
+) -> Dict[str, object]:
+    """Claim one stable batch of tied-optimal structures.
+
+    Structures are ordered by the same ASCII lexicographic dot-bracket order
+    used by :func:`fold`.  The returned cursor is bound to both the sequence
+    and the normalized hard constraints; it cannot resume a different input.
+    """
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError("batch_size: expected a positive integer")
+    if not 1 <= batch_size <= MAX_BATCH_SIZE:
+        raise ValueError(
+            f"batch_size must be in [1, {MAX_BATCH_SIZE}], got {batch_size}"
+        )
+
+    result = _compute_fold(sequence, constraints)
+    seq = result["_model"]["sequence"]
+    partner = result["_model"]["partner"]
+    force_up = result["_model"]["force_up"]
+    fingerprint = _input_fingerprint(seq, partner, force_up)
+    offset = 0 if cursor is None else _decode_cursor(cursor, fingerprint)
+
+    frontier: List[Tuple[str, int, str, Tuple[object, ...]]] = []
+    heapq.heappush(
+        frontier,
+        (result["structure"], 0, "", ((0, len(seq)),)),
+    )
+
+    structures: List[Dict[str, object]] = []
+    produced = 0
+    next_structure = _next_optimal_structure(frontier, seq, result["_model"])
+    while next_structure is not None and produced < offset + batch_size:
+        if produced >= offset:
+            structures.append(
+                {
+                    "structure": next_structure,
+                    "pairs": _structure_pairs(next_structure),
+                }
+            )
+        produced += 1
+        next_structure = _next_optimal_structure(
+            frontier, seq, result["_model"]
+        )
+
+    has_more = next_structure is not None or bool(frontier)
+    next_offset = offset + len(structures)
+    return {
+        "score": result["score"],
+        "count": result["count"],
+        "structures": tuple(structures),
+        "next_cursor": _encode_cursor(next_offset, fingerprint)
+        if has_more
+        else None,
+        "has_more": has_more,
     }

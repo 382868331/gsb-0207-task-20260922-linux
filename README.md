@@ -18,7 +18,7 @@
 # 运行全部必要测试（独立穷举参考 + DP 对拍）
 python -m unittest discover -s tests -v
 
-# 运行固定输入演示：2 个真实计算结果 + 2 个真实触发的拒绝
+# 运行固定输入演示：普通折叠/并列最优批次 + 2 个真实触发的拒绝
 python demo.py
 ```
 
@@ -58,6 +58,25 @@ result = fold(sequence, constraints=None)
 
 字典序按 ASCII 码比较，即 `'(' < ')' < '.'`。
 
+### 按批次领取并列最优结构
+
+```python
+from rna_fold import fold_batch
+
+page = fold_batch(sequence, constraints=None, batch_size=10, cursor=None)
+# 下一批把 page["next_cursor"] 传回 cursor；取完后为 None
+```
+
+- `batch_size`：每批数量，整数，范围 `1..1000`；布尔值会被拒绝。
+- `cursor`：首次传 `None`；续取传回上一批的 `next_cursor`。凭证已签名，
+  篡改会抛出 `InvalidCursorError`。
+- 返回字段：`score`、`count`、`structures`、`has_more`、`next_cursor`；
+  `count` 是全部最优结构数量（模 1,000,000,007），每个 `structures` 元素包含
+  `structure` 与对应的 `pairs`。
+- 领取顺序与 `fold()` 的 ASCII 字典序一致；每个结构只出现一次。重复调用同一个
+  凭证会幂等返回同一页，不会跳过或重复消费。
+- 凭证绑定具体序列以及规范化后的强制配对/强制未配约束；换序列或约束不能沿用。
+
 ### 合法结构规则（题面契约）
 
 - 只允许 `AU, UA, GC, CG, GU, UG` 六种配对；
@@ -84,6 +103,8 @@ result = fold(sequence, constraints=None)
   **搜索预算耗尽**（未能证明最优）。它与「证明无解」是刻意分开的两个类型，
   互不构成子类。由于 n ≤ 120 时精确 DP 总是完整枚举整个解空间，本实现**永不
   抛出**该异常；它作为固定错误语义的一部分保留。
+- `rna_fold.InvalidCursorError(ValueError)`：批次凭证格式错误、签名不合法，
+  或不属于当前序列与约束。
 
 数值输入契约：整数参数拒绝 `bool`（`True/False` 不当作 1/0）；`float` 的
 `NaN`/`Infinity` 分别按名称拒绝，其他非整数浮点报 `TypeError`。
@@ -102,6 +123,10 @@ result = fold(sequence, constraints=None)
 - **字典序最小结构**：第二张区间表从短到长重建；同一最优分值下，
   `i` 未配的候选为 `"."+...`，`i` 配对的候选为 `"("+...+")"+...`，
   取 ASCII 最小者。配对候选按 `t` 升序取最小。
+- **并列最优结构的批次领取**：批量接口从根区间维护一个按“当前最小可能完整串”
+  排序的小顶堆，只展开产生当前批次及判断下一项所需的搜索状态，不预生成或缓存
+  全部并列结构。续取时按签名凭证中的偏移量重新建立懒搜索并跳过已领取前缀；凭证
+  包含序列与规范化约束的 BLAKE2b 指纹，输入变化即失效。
 - **可出现在最优中的配对**：从根区间 `[0,n)` 沿「保持最优分值」的决策做
   可达性传播；可达区间上的任何最优配对都至少属于一个全局最优结构。
   可达性只由分值表（可行性）决定，**不使用取模后的计数**，因此即使某子结构
@@ -130,16 +155,17 @@ result = fold(sequence, constraints=None)
   无温度、无自由能 kcal/mol、无堆栈/凸包/多分支环能量项），不与 ViennaRNA 等
   行业标准兼容。
 - 禁止假结（非交叉）；不预测三链、修饰碱基、非 `ACGU` 字母（如 N、I）。
-- 只输出单一字典序最小最优结构；其余并列最优结构以 `count` 与 `pairs` 概括，
-  不逐个枚举（n=120 时枚举全部结构不现实）。
+- `fold()` 只返回单一字典序最小最优结构；需要逐个查看时使用 `fold_batch()`。
+  批量接口是惰性展开，不保证快速跳转到任意很深的偏移，也不建议主动枚举全部结构
+  （n=120 时并列结构数量可能极大）。
 - `BudgetExceededError` 在当前确定性 DP 下不会被抛出；它是为语义完整性保留的
   公开类型。
 
 ## 仓库内容
 
 ```
-rna_fold.py            # 核心模块：fold() 与公开异常/常量
-demo.py                # 固定输入演示（真实计算 + 真实拒绝）
+rna_fold.py            # 核心模块：fold()/fold_batch() 与公开异常/常量
+demo.py                # 固定输入演示（真实计算、批次领取 + 真实拒绝）
 tests/test_fold.py     # 必要测试（对拍、约束、GU、并列最优、非法输入等）
 tests/brute_reference.py  # 独立穷举参考（n<=14，不调用被测核心）
 README.md

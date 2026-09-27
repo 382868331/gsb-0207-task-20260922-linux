@@ -129,5 +129,6 @@ def brute_force(
         "structure": lex_min,
         "count": opt_count % MOD,
         "exact_count": opt_count,
+        "structures": tuple(sorted(s for _, s, _ in opt)),
         "pairs": frozenset(all_pairs),
     }

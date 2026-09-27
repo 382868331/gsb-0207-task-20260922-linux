@@ -4,8 +4,8 @@
 Run with:  python demo.py
 
 Everything is computed live by the exact algorithm (no sleep, no pre-recorded
-output).  It prints one normal, successful fold and one hard-constraint
-conflict that is actually rejected.
+output).  It prints normal folds, a tied-optima batch, and two hard input
+boundaries that are actually rejected.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from rna_fold import (
     ConstraintError,
     InvalidSequenceError,
     fold,
+    fold_batch,
 )
 
 
@@ -57,6 +58,15 @@ def main() -> None:
     )
     assert (0, 14) in res2["pairs"]
 
+    batch = fold_batch(seq1, forced, batch_size=2)
+    print(f"batch score : {batch['score']}")
+    print(f"total count : {batch['count']} (mod 1_000_000_007)")
+    for idx, item in enumerate(batch["structures"], start=1):
+        print(f"  optimum {idx}: {item['structure']}")
+    print(f"has more    : {batch['has_more']}")
+    assert len(batch["structures"]) == res2["count"]
+    assert batch["next_cursor"] is None
+
     # --- 3. Actual rejection: conflicting hard constraints ---------------
     # (0,9)=G-C and (4,13)=A-U are each individually legal, but they cross
     # (0 < 4 < 9 < 13): a pseudoknot, rejected up front with locations.
@@ -85,7 +95,7 @@ def main() -> None:
         raise AssertionError("expected an InvalidSequenceError")
 
     print("=" * 64)
-    print("demo finished: 2 successful folds and 2 live rejections.")
+    print("demo finished: normal folds, a tied-optima batch, and 2 rejections.")
 
 
 if __name__ == "__main__":

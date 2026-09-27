@@ -16,8 +16,10 @@ from rna_fold import (
     BudgetExceededError,
     ConstraintError,
     InvalidSequenceError,
+    InvalidCursorError,
     UnsatisfiableConstraintError,
     fold,
+    fold_batch,
 )
 from tests.brute_reference import brute_force
 
@@ -303,6 +305,154 @@ class LexOrderTests(unittest.TestCase):
             res = fold(seq)
             ref = brute_force(seq)
             self.assertEqual(res["structure"], ref["structure"])
+
+
+class BatchOptimaTests(unittest.TestCase):
+    def _claim_all(self, seq, constraints=None, batch_size=3):
+        structures = []
+        cursor = None
+        first = None
+        while True:
+            batch = fold_batch(
+                seq,
+                constraints,
+                batch_size=batch_size,
+                cursor=cursor,
+            )
+            if first is None:
+                first = batch
+            batch_structures = [item["structure"] for item in batch["structures"]]
+            self.assertLessEqual(len(batch_structures), batch_size)
+            structures.extend(batch_structures)
+            cursor = batch["next_cursor"]
+            if cursor is None:
+                self.assertFalse(batch["has_more"])
+                break
+            self.assertTrue(batch["has_more"])
+        return first, structures
+
+    def test_batches_match_bruteforce_order(self):
+        rng = random.Random(8821)
+        for n in range(0, 14):
+            for _ in range(30 if n else 1):
+                seq = "".join(rng.choice("ACGU") for _ in range(n))
+                first, structures = self._claim_all(
+                    seq, batch_size=rng.randint(1, 5)
+                )
+                ref = brute_force(seq)
+                self.assertEqual(structures, list(ref["structures"]))
+                self.assertEqual(first["score"], ref["score"])
+                self.assertEqual(first["count"], ref["count"])
+                self.assertEqual(len(structures), len(set(structures)))
+                for item in first["structures"]:
+                    self.assertEqual(set(item["pairs"]),
+                                     structure_pairs(item["structure"]))
+                for structure in structures:
+                    self.assertTrue(structure_is_legal(seq, structure))
+
+    def test_batches_respect_forced_constraints(self):
+        seq = "GAAAAAAAAAAAAU"
+        constraints = {"pairs": [(0, 13)], "unpaired": [1]}
+        first, structures = self._claim_all(seq, constraints, batch_size=2)
+        ref = brute_force(
+            seq, frozenset({(0, 13)}), frozenset({1})
+        )
+        self.assertEqual(structures, list(ref["structures"]))
+        self.assertEqual(first["score"], ref["score"])
+        self.assertEqual(first["count"], ref["count"])
+        for structure in structures:
+            pairs = structure_pairs(structure)
+            self.assertIn((0, 13), pairs)
+            self.assertTrue(
+                {1}.isdisjoint(p for pair in pairs for p in pair)
+            )
+
+    def test_random_constrained_batches_match_bruteforce(self):
+        rng = random.Random(4419)
+        for n in (8, 10, 12, 14):
+            for _ in range(20):
+                seq = "".join(rng.choice("ACGU") for _ in range(n))
+                legal = [
+                    (a, b)
+                    for a in range(n)
+                    for b in range(a + 4, n)
+                    if (seq[a], seq[b]) in PAIR_SCORES
+                ]
+                rng.shuffle(legal)
+                forced = []
+                used = set()
+                for a, b in legal:
+                    if a in used or b in used:
+                        continue
+                    if any(
+                        (a < c < b < d) or (c < a < d < b)
+                        for c, d in forced
+                    ):
+                        continue
+                    forced.append((a, b))
+                    used.update((a, b))
+                    if len(forced) == 2:
+                        break
+                free_positions = [p for p in range(n) if p not in used]
+                unpaired = set(
+                    rng.sample(free_positions, min(1, len(free_positions)))
+                ) if free_positions else set()
+                constraints = {"pairs": forced, "unpaired": unpaired}
+                _, structures = self._claim_all(
+                    seq, constraints, batch_size=rng.randint(1, 4)
+                )
+                ref = brute_force(
+                    seq, frozenset(forced), frozenset(unpaired)
+                )
+                self.assertEqual(structures, list(ref["structures"]))
+
+    def test_empty_input_has_single_empty_batch(self):
+        batch = fold_batch("")
+        self.assertEqual(batch["score"], 0)
+        self.assertEqual(len(batch["structures"]), 1)
+        self.assertEqual(batch["structures"][0]["structure"], "")
+        self.assertEqual(batch["structures"][0]["pairs"], ())
+        self.assertIsNone(batch["next_cursor"])
+        self.assertFalse(batch["has_more"])
+
+    def test_cursor_is_bound_to_sequence_and_constraints(self):
+        seq = "CGAGGG"
+        page = fold_batch(seq, batch_size=1)
+        cursor = page["next_cursor"]
+        self.assertIsNotNone(cursor)
+
+        with self.assertRaises(InvalidCursorError):
+            fold_batch("GCGCGCGCGU", batch_size=1, cursor=cursor)
+        with self.assertRaises(InvalidCursorError):
+            fold_batch(
+                seq,
+                {"unpaired": [0]},
+                batch_size=1,
+                cursor=cursor,
+            )
+        with self.assertRaises(InvalidCursorError):
+            fold_batch(seq, batch_size=1, cursor=cursor + "x")
+
+        same_page = fold_batch(seq, batch_size=1, cursor=cursor)
+        continuation = fold_batch(seq, batch_size=1, cursor=page["next_cursor"])
+        self.assertEqual(
+            [x["structure"] for x in same_page["structures"]],
+            [x["structure"] for x in continuation["structures"]],
+        )
+        self.assertNotEqual(
+            page["structures"][0]["structure"],
+            same_page["structures"][0]["structure"],
+        )
+
+    def test_batch_size_validation(self):
+        with self.assertRaises(ValueError):
+            fold_batch("GCGAAAC", batch_size=0)
+        with self.assertRaises(ValueError):
+            fold_batch("GCGAAAC", batch_size=1001)
+        with self.assertRaises(TypeError):
+            fold_batch("GCGAAAC", batch_size=True)
+        with self.assertRaises(InvalidCursorError):
+            fold_batch("GCGAAAC", cursor=b"not-a-token")
 
 
 class InputValidationTests(unittest.TestCase):
