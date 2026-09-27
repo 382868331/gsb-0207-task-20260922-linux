@@ -1,6 +1,10 @@
 """RNA secondary structure prediction with forced pairings.
 
-Single public entry point: :func:`fold`.
+Public entry points:
+
+* :func:`fold` -- best score, lex-smallest optimum, modular count, pair set;
+* :func:`claim_optimal_structures` -- stable, batched, lazy claiming of the
+  tied-optimal structures via an input-bound opaque continuation cursor.
 
 The implementation is an exact, non-crossing (pseudoknot-free) interval
 dynamic program.  It performs an exhaustive search over every admissible
@@ -11,17 +15,22 @@ contract.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import math
 from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 __all__ = [
     "fold",
+    "claim_optimal_structures",
     "InvalidSequenceError",
     "ConstraintError",
+    "CursorError",
     "UnsatisfiableConstraintError",
     "BudgetExceededError",
     "MIN_HAIRPIN",
     "MAX_SEQUENCE_LENGTH",
+    "MAX_BATCH_LIMIT",
     "PAIR_SCORES",
     "MOD",
 ]
@@ -30,6 +39,9 @@ MIN_HAIRPIN = 3
 """Minimum number of *unpaired* positions inside a pair (j - i >= 4)."""
 
 MAX_SEQUENCE_LENGTH = 120
+
+MAX_BATCH_LIMIT = 100
+"""Maximum number of tied-optimal structures returned in one claim batch."""
 
 MOD = 1_000_000_007
 
@@ -60,6 +72,15 @@ class ConstraintError(ValueError):
 
     The message always identifies the offending position (0-based) or the
     offending constraint entry.
+    """
+
+
+class CursorError(ValueError):
+    """A continuation cursor is malformed, tampered with, or does not match
+    the current (sequence, constraints) input.
+
+    Cursors bind to one concrete input: a cursor produced for one sequence
+    (or for different constraints) can never be reused for another input.
     """
 
 
@@ -306,42 +327,17 @@ def _normalise_constraints(
 # ---------------------------------------------------------------------------
 
 
-def fold(
-    sequence: str,
-    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
-) -> Dict[str, object]:
-    """Fold ``sequence`` into a maximum-score non-crossing secondary structure.
+def _solve(
+    seq: str, partner: List[int], force_up: List[int]
+) -> "_OptimalTables":
+    """Run the exact interval DP and build all reconstruction tables.
 
-    :param sequence: RNA sequence over ``A C G U`` (case sensitive),
-        length <= 120.
-    :param constraints: ``None``, or either
-
-        * a string of the sequence length: ``.`` free, ``x`` forced
-          unpaired, and matched brackets ``() [] {} <>`` forcing the paired
-          positions; or
-        * a dict with ``"pairs"``: iterable of ``(i, j)`` integer pairs and
-          ``"unpaired"``: iterable of integer positions (all 0-based).
-
-        Forced pairs must be complementary, satisfy ``j - i >= 4``, share no
-        endpoint, and not cross.
-    :returns: dict with
-
-        * ``score`` (int): maximum total score (GC=3, AU=2, GU=1);
-        * ``structure`` (str): lexicographically smallest dot-bracket string
-          among all maximum-score structures (ASCII order, so ``'(' < ')' <
-          '.'``);
-        * ``count`` (int): number of maximum-score structures, modulo
-          1_000_000_007;
-        * ``pairs`` (tuple of ``(i, j)``): every pair that occurs in *at
-          least one* maximum-score structure, sorted.
-    :raises TypeError: wrong value types (including ``bool`` as int).
-    :raises InvalidSequenceError: bad length or illegal character.
-    :raises ConstraintError: malformed or conflicting constraints.
-    :raises UnsatisfiableConstraintError: proven that no admissible structure
-        satisfies the forced constraints.
+    The DP itself never materialises any concrete structure beyond the
+    per-interval lexicographically smallest witness (``lex``).  ``alts``
+    stores, per feasible interval, the *optimal* decisions as lightweight
+    templates; :class:`_OptimalEnumerator` walks them on demand so tied
+    optima are generated lazily.
     """
-    seq = _validate_sequence(sequence)
-    partner, force_up = _normalise_constraints(constraints, seq)
     n = len(seq)
 
     # A *closed* interval [i, j) is one where every position p in [i, j)
@@ -351,9 +347,7 @@ def fold(
     # endpoint from its mate and is automatically unreachable.
     # closed[i][j] is maintained as: (forced endpoints in interval) ==
     # 2 * (forced pairs fully inside the interval).
-    closed: List[List[bool]] = [
-        [False] * (n + 1) for _ in range(n + 1)
-    ]
+    closed: List[List[bool]] = [[False] * (n + 1) for _ in range(n + 1)]
     for i in range(n + 1):
         endpoint_count = 0
         inside_pairs = 0
@@ -363,7 +357,7 @@ def fold(
             if partner[p] != -1:
                 endpoint_count += 1
                 m = partner[p]
-                if i <= m < p:  # the right endpoint of a pair fully inside
+                if i <= m < p:  # right endpoint of a pair fully inside
                     inside_pairs += 1
             closed[i][j] = endpoint_count == 2 * inside_pairs
 
@@ -426,22 +420,29 @@ def fold(
             "all forced pairs"
         )
 
-    # Lexicographically smallest optimal structure per interval.
+    # Lexicographically smallest optimal structure per interval, together
+    # with the list of optimal decision templates for each interval.
+    #
+    # A template node is either ("lit", ch) -- a fixed dot-bracket character
+    # -- or ("sub", a, b) -- any optimal structure of sub-interval [a, b).
+    # Templates are paired-first to match ASCII order ('(' = 40 < '.' = 46),
+    # but callers always take the minimum explicitly, so order is not relied
+    # upon for correctness.
     lex: List[List[str]] = [[""] * (n + 1) for _ in range(n + 1)]
+    alts: List[List[List[Tuple[object, ...]]]] = [
+        [[] for _ in range(n + 1)] for _ in range(n + 1)
+    ]
+    for i in range(n + 1):
+        lex[i][i] = ""
+
     for length in range(1, n + 1):
         for i in range(0, n - length + 1):
             j = i + length
             if best[i][j] == _NEG:
-                continue  # infeasible interval: no witness string
+                continue  # infeasible interval: no witness or template
             target = best[i][j]
+            templates: List[List[Tuple[object, ...]]] = []
             chosen: Optional[str] = None
-
-            if (
-                partner[i] == -1
-                and closed[i + 1][j]
-                and best[i + 1][j] == target
-            ):
-                chosen = "." + lex[i + 1][j]
 
             for t in range(i + MIN_HAIRPIN + 1, j):
                 if not pair_allowed(i, t):
@@ -455,9 +456,28 @@ def fold(
                 v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
                 if v != target:
                     continue
+                template = [
+                    ("lit", "("),
+                    ("sub", i + 1, t),
+                    ("lit", ")"),
+                    ("sub", t + 1, j),
+                ]
+                templates.append(template)
                 candidate = (
                     "(" + lex[i + 1][t] + ")" + lex[t + 1][j]
                 )
+                if chosen is None or candidate < chosen:
+                    chosen = candidate
+
+            if (
+                partner[i] == -1
+                and closed[i + 1][j]
+                and best[i + 1][j] == target
+            ):
+                templates.append(
+                    [("lit", "."), ("sub", i + 1, j)]
+                )
+                candidate = "." + lex[i + 1][j]
                 if chosen is None or candidate < chosen:
                     chosen = candidate
 
@@ -465,9 +485,243 @@ def fold(
             # table values are maxima over enumerated options).
             assert chosen is not None and len(chosen) == length
             lex[i][j] = chosen
+            alts[i][j] = templates
+
+    return _OptimalTables(
+        seq=seq,
+        partner=partner,
+        force_up=force_up,
+        closed=closed,
+        best=best,
+        ways=ways,
+        lex=lex,
+        alts=alts,
+    )
+
+
+class _OptimalTables:
+    """Bundle of DP tables shared by :func:`fold` and the lazy enumerator."""
+
+    __slots__ = ("seq", "partner", "force_up", "closed", "best", "ways",
+                 "lex", "alts")
+
+    def __init__(
+        self,
+        seq: str,
+        partner: List[int],
+        force_up: List[int],
+        closed: List[List[bool]],
+        best: List[List[int]],
+        ways: List[List[int]],
+        lex: List[List[str]],
+        alts: List[List[List[Tuple[object, ...]]]],
+    ) -> None:
+        self.seq = seq
+        self.partner = partner
+        self.force_up = force_up
+        self.closed = closed
+        self.best = best
+        self.ways = ways
+        self.lex = lex
+        self.alts = alts
+
+
+class _OptimalEnumerator:
+    """Lazy enumeration of optimal dot-bracket strings in strict lex order.
+
+    The only state carried between claims is the previously returned string
+    (kept in the caller's opaque cursor).  Each successor is found by a
+    bounded search for "smallest optimal completion strictly greater than the
+    bound" over decision templates; unclaimed structures are never expanded.
+    """
+
+    def __init__(self, tables: _OptimalTables) -> None:
+        self.t = tables
+        self._ng_cache: Dict[Tuple[int, int, str], Optional[str]] = {}
+        self._member_cache: Dict[Tuple[int, int, str], bool] = {}
+
+    # -- membership ------------------------------------------------------
+
+    def is_member(self, i: int, j: int, s: str) -> bool:
+        """True iff ``s`` is an optimal structure of closed interval [i, j)."""
+        if len(s) != j - i:
+            return False
+        key = (i, j, s)
+        cached = self._member_cache.get(key)
+        if cached is not None:
+            return cached
+        ok = self._check_member(i, j, s)
+        self._member_cache[key] = ok
+        return ok
+
+    def _check_member(self, i: int, j: int, s: str) -> bool:
+        if i == j:
+            return s == ""
+        if self.t.best[i][j] == _NEG:
+            return False
+        for template in self.t.alts[i][j]:
+            if self._template_matches(template, s):
+                return True
+        return False
+
+    def _template_matches(
+        self, template: List[Tuple[object, ...]], s: str
+    ) -> bool:
+        pos = 0
+        for node in template:
+            if node[0] == "lit":
+                if pos >= len(s) or s[pos] != node[1]:
+                    return False
+                pos += 1
+            else:
+                a, b = node[1], node[2]
+                length = b - a
+                if not self.is_member(a, b, s[pos:pos + length]):
+                    return False
+                pos += length
+        return pos == len(s)
+
+    # -- strict successor ------------------------------------------------
+
+    def next_greater(self, i: int, j: int, bound: str) -> Optional[str]:
+        """Smallest optimal structure of [i, j) strictly greater than bound."""
+        if i == j or self.t.best[i][j] == _NEG:
+            return None
+        if len(bound) != j - i:
+            return None
+        key = (i, j, bound)
+        if key in self._ng_cache:
+            return self._ng_cache[key]
+        result: Optional[str] = None
+        for template in self.t.alts[i][j]:
+            candidate = self._render_greater(template, bound)
+            if candidate is not None and (
+                result is None or candidate < result
+            ):
+                result = candidate
+        self._ng_cache[key] = result
+        return result
+
+    def _render_greater(
+        self, template: List[Tuple[object, ...]], bound: str
+    ) -> Optional[str]:
+        """Smallest instantiation of ``template`` strictly > ``bound``.
+
+        A strict increase happens at exactly one node: a fixed literal is
+        greater than the bound character, or a sub-interval contributes its
+        own strict successor.  Every earlier node must equal the bound slice;
+        every later node contributes its own lexicographic minimum.  Each
+        sub-interval is an independent dot-bracket segment, so its minimum
+        needs no compatibility adjustment against the fixed brackets the
+        template places around it.
+        """
+        spans: List[Tuple[str, int, int, object]] = []
+        pos = 0
+        for node in template:
+            if node[0] == "lit":
+                ch = node[1]
+                spans.append(("lit", pos, pos + 1, ch))
+                pos += 1
+            else:
+                a, b = node[1], node[2]
+                spans.append(("sub", pos, pos + (b - a), (a, b)))
+                pos += b - a
+
+        total = pos
+        if len(bound) != total:
+            return None
+        best: Optional[str] = None
+
+        for div in range(len(spans)):
+            equal_parts: List[str] = []
+            feasible = True
+            for kind, p0, p1, payload in spans[:div]:
+                if kind == "lit":
+                    if payload != bound[p0]:
+                        feasible = False
+                        break
+                    equal_parts.append(payload)
+                else:
+                    a, b = payload
+                    sub_bound = bound[p0:p1]
+                    if not self.is_member(a, b, sub_bound):
+                        feasible = False
+                        break
+                    equal_parts.append(sub_bound)
+            if not feasible:
+                continue
+
+            kind, p0, p1, payload = spans[div]
+            if kind == "lit":
+                if payload <= bound[p0]:
+                    continue
+                diverging = payload
+            else:
+                a, b = payload
+                jump = self.next_greater(a, b, bound[p0:p1])
+                if jump is None:
+                    continue
+                diverging = jump
+
+            suffix_parts: List[str] = []
+            for kind2, _q0, _q1, payload2 in spans[div + 1:]:
+                if kind2 == "lit":
+                    suffix_parts.append(payload2)
+                else:
+                    a, b = payload2
+                    suffix_parts.append(self.t.lex[a][b])
+
+            candidate = "".join(equal_parts) + diverging + "".join(
+                suffix_parts
+            )
+            assert len(candidate) == total
+            if best is None or candidate < best:
+                best = candidate
+        return best
+
+
+def fold(
+    sequence: str,
+    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+) -> Dict[str, object]:
+    """Fold ``sequence`` into a maximum-score non-crossing secondary structure.
+
+    :param sequence: RNA sequence over ``A C G U`` (case sensitive),
+        length <= 120.
+    :param constraints: ``None``, or either
+
+        * a string of the sequence length: ``.`` free, ``x`` forced
+          unpaired, and matched brackets ``() [] {} <>`` forcing the paired
+          positions; or
+        * a dict with ``"pairs"``: iterable of ``(i, j)`` integer pairs and
+          ``"unpaired"``: iterable of integer positions (all 0-based).
+
+        Forced pairs must be complementary, satisfy ``j - i >= 4``, share no
+        endpoint, and not cross.
+    :returns: dict with
+
+        * ``score`` (int): maximum total score (GC=3, AU=2, GU=1);
+        * ``structure`` (str): lexicographically smallest dot-bracket string
+          among all maximum-score structures (ASCII order, so ``'(' < ')' <
+          '.'``);
+        * ``count`` (int): number of maximum-score structures, modulo
+          1_000_000_007;
+        * ``pairs`` (tuple of ``(i, j)``): every pair that occurs in *at
+          least one* maximum-score structure, sorted.
+    :raises TypeError: wrong value types (including ``bool`` as int).
+    :raises InvalidSequenceError: bad length or illegal character.
+    :raises ConstraintError: malformed or conflicting constraints.
+    :raises UnsatisfiableConstraintError: proven that no admissible structure
+        satisfies the forced constraints.
+    """
+    seq = _validate_sequence(sequence)
+    partner, force_up = _normalise_constraints(constraints, seq)
+    tables = _solve(seq, partner, force_up)
+    best = tables.best
 
     # Pairs appearing in at least one global optimum: propagate reachability
     # of intervals along optimal decisions from the root [0, n).
+    n = len(seq)
     reachable = [[False] * (n + 1) for _ in range(n + 1)]
     reachable[0][n] = True
     can_pair: set[Tuple[int, int]] = set()
@@ -486,30 +740,214 @@ def fold(
             # wrongly omitted.
             if (
                 partner[i] == -1
-                and closed[i + 1][j]
+                and tables.closed[i + 1][j]
                 and best[i + 1][j] == target
             ):
                 reachable[i + 1][j] = True
 
-            for t in range(i + MIN_HAIRPIN + 1, j):
-                if not pair_allowed(i, t):
+            for template in tables.alts[i][j]:
+                first = template[0]
+                if first[0] != "lit" or first[1] != "(":
                     continue
-                if not closed[i + 1][t] or not closed[t + 1][j]:
-                    continue
-                s_in = best[i + 1][t]
-                s_out = best[t + 1][j]
-                if s_in == _NEG or s_out == _NEG:
-                    continue
-                v = PAIR_SCORES[(seq[i], seq[t])] + s_in + s_out
-                if v != target:
-                    continue
+                t = template[1][2]  # inner sub-interval is [i + 1, t)
                 can_pair.add((i, t))
-                reachable[i + 1][t] = True
-                reachable[t + 1][j] = True
+                for node in template:
+                    if node[0] == "sub":
+                        reachable[node[1]][node[2]] = True
 
     return {
         "score": best[0][n],
-        "structure": lex[0][n],
-        "count": ways[0][n],
+        "structure": tables.lex[0][n],
+        "count": tables.ways[0][n],
         "pairs": tuple(sorted(can_pair)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Batched claiming of tied-optimal structures
+# ---------------------------------------------------------------------------
+
+_CURSOR_VERSION = "v1"
+_CURSOR_SECRET_MARKER = "rna-fold-opt-claim"
+
+
+def _fingerprint(
+    seq: str, partner: List[int], force_up: List[int]
+) -> str:
+    """Stable token binding one cursor to one concrete input.
+
+    The fingerprint covers the validated sequence and the *normalised*
+    constraints, so equivalent constraint spellings share a cursor while a
+    different sequence or different forced pairs/unpaired positions never do.
+    """
+    forced_pairs = sorted(
+        (i, partner[i])
+        for i in range(len(partner))
+        if partner[i] > i
+    )
+    forced_up = sorted(p for p, flag in enumerate(force_up) if flag)
+    payload = (
+        f"n={len(seq)}|seq={seq}|pairs={forced_pairs}|unpaired={forced_up}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _encode_cursor(
+    fingerprint: str, after: str, score: int
+) -> str:
+    body = f"{_CURSOR_VERSION}|{fingerprint}|{score}|{after}"
+    sig = hashlib.sha256(
+        (body + "|" + _CURSOR_SECRET_MARKER).encode("utf-8")
+    ).hexdigest()[:32]
+    raw = f"{body}|{sig}"
+    return "rf1_" + base64.urlsafe_b64encode(
+        raw.encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: object) -> Tuple[str, str, int, str]:
+    """Decode and integrity-check a cursor; raise :class:`CursorError`."""
+    if not isinstance(cursor, str) or not cursor.startswith("rf1_"):
+        raise CursorError("cursor: malformed continuation token")
+    try:
+        padded = cursor[4:] + "=" * (-len(cursor[4:]) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CursorError("cursor: malformed continuation token") from exc
+    parts = raw.split("|")
+    if len(parts) != 5 or parts[0] != _CURSOR_VERSION:
+        raise CursorError("cursor: unsupported or malformed continuation token")
+    _, fingerprint, score_text, after, sig = parts
+    body = raw[: raw.rfind("|")]
+    expected = hashlib.sha256(
+        (body + "|" + _CURSOR_SECRET_MARKER).encode("utf-8")
+    ).hexdigest()[:32]
+    if not _constant_time_eq(sig, expected):
+        raise CursorError("cursor: integrity check failed (tampered token)")
+    try:
+        score = int(score_text)
+    except ValueError as exc:
+        raise CursorError("cursor: malformed score field") from exc
+    return fingerprint, after, score, sig
+
+
+def _constant_time_eq(a: str, b: str) -> bool:
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= ord(x) ^ ord(y)
+    return diff == 0
+
+
+def claim_optimal_structures(
+    sequence: str,
+    constraints: "Optional[str | Mapping[str, Iterable[object]]]" = None,
+    limit: int = 10,
+    cursor: Optional[str] = None,
+) -> Dict[str, object]:
+    """Claim one batch of tied-optimal structures in stable order.
+
+    Every returned structure is a maximum-score admissible structure: it
+    respects every forced pair and forced-unpaired position, the minimum
+    hairpin gap, complementarity and non-crossing rules.  Across batches the
+    structures are emitted in strictly increasing dot-bracket lexicographic
+    order (ASCII), so the same structure is never returned twice.
+
+    Structures are generated lazily: only the ``limit`` (plus one probe)
+    successors are searched per call; structures that have not been claimed
+    yet are never expanded into memory.
+
+    :param sequence: RNA sequence over ``A C G U`` (case sensitive),
+        length <= 120.
+    :param constraints: same forms as :func:`fold`.
+    :param limit: batch size, an integer with ``1 <= limit <= 100``.
+        ``bool`` is rejected like other integer parameters.
+    :param cursor: ``None`` for the first claim, or the ``next_cursor``
+        string returned by the previous claim.  A cursor is bound to one
+        concrete (sequence, constraints) input and is rejected on mismatch.
+    :returns: dict with
+
+        * ``structures`` (tuple of str): this batch, sorted lexicographically;
+        * ``score`` (int): the common optimal score;
+        * ``count`` (int): total number of optimal structures, modulo
+          1_000_000_007 (independent of how many were claimed);
+        * ``next_cursor`` (str | None): opaque continuation token, or
+          ``None`` when every optimal structure has been claimed;
+        * ``done`` (bool): ``True`` exactly when ``next_cursor is None``.
+    :raises TypeError: wrong value types (including ``bool`` as int).
+    :raises InvalidSequenceError: bad length or illegal character.
+    :raises ConstraintError: malformed or conflicting constraints.
+    :raises CursorError: malformed/tampered cursor, or cursor bound to a
+        different sequence or different constraints.
+    :raises UnsatisfiableConstraintError: proven unsatisfiable constraints.
+    """
+    limit = _as_int(limit, "limit")
+    if not 1 <= limit <= MAX_BATCH_LIMIT:
+        raise ValueError(
+            f"limit={limit}: must satisfy 1 <= limit <= {MAX_BATCH_LIMIT}"
+        )
+    if cursor is not None and not isinstance(cursor, str):
+        raise CursorError(
+            f"cursor: expected str or None, got {type(cursor).__name__}"
+        )
+
+    seq = _validate_sequence(sequence)
+    partner, force_up = _normalise_constraints(constraints, seq)
+    fingerprint = _fingerprint(seq, partner, force_up)
+
+    after: Optional[str] = None
+    if cursor is not None:
+        cursor_fp, cursor_after, cursor_score, _sig = _decode_cursor(cursor)
+        if cursor_fp != fingerprint:
+            raise CursorError(
+                "cursor does not match this input: it was created for a "
+                "different sequence or different constraints"
+            )
+        if len(cursor_after) != len(seq):
+            raise CursorError(
+                "cursor: bound structure length does not match the input"
+            )
+        after = cursor_after
+
+    tables = _solve(seq, partner, force_up)
+
+    if after is not None:
+        if cursor_score != tables.best[0][len(seq)]:
+            # Covered in practice by the fingerprint, but never hand out a
+            # cursor whose recorded score disagrees with the solved input.
+            raise CursorError("cursor: recorded score disagrees with input")
+        enumerator = _OptimalEnumerator(tables)
+        if not enumerator.is_member(0, len(seq), after):
+            raise CursorError(
+                "cursor: bound structure is not an optimal structure of "
+                "this input"
+            )
+        current = enumerator.next_greater(0, len(seq), after)
+    else:
+        enumerator = _OptimalEnumerator(tables)
+        current = tables.lex[0][len(seq)]
+
+    batch: List[str] = []
+    n = len(seq)
+    while current is not None and len(batch) < limit:
+        batch.append(current)
+        current = enumerator.next_greater(0, n, current)
+
+    done = current is None
+    if done:
+        next_cursor = None
+    else:
+        # One probe (``current``) beyond the batch was searched; it is not
+        # returned now, so unclaimed structures stay unexpanded.
+        next_cursor = _encode_cursor(
+            fingerprint, batch[-1], tables.best[0][n]
+        )
+
+    return {
+        "structures": tuple(batch),
+        "score": tables.best[0][n],
+        "count": tables.ways[0][n],
+        "next_cursor": next_cursor,
+        "done": done,
     }

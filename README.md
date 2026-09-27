@@ -18,7 +18,7 @@
 # 运行全部必要测试（独立穷举参考 + DP 对拍）
 python -m unittest discover -s tests -v
 
-# 运行固定输入演示：2 个真实计算结果 + 2 个真实触发的拒绝
+# 运行固定输入演示：2 个真实计算结果 + 并列最优批次领取 + 2 个真实拒绝
 python demo.py
 ```
 
@@ -31,6 +31,9 @@ python demo.py
 from rna_fold import fold
 
 result = fold(sequence, constraints=None)
+from rna_fold import claim_optimal_structures
+
+batch = claim_optimal_structures(sequence, constraints=None, limit=10, cursor=None)
 ```
 
 ### 参数
@@ -58,6 +61,43 @@ result = fold(sequence, constraints=None)
 
 字典序按 ASCII 码比较，即 `'(' < ')' < '.'`。
 
+### 并列最优结构的分批领取：`claim_optimal_structures`
+
+当多个结构同分并列、而 `fold()` 只返回字典序最小者时，可用本接口按批次继续
+领取其余并列最优结构。
+
+```python
+first  = claim_optimal_structures(sequence, constraints, limit=10)
+second = claim_optimal_structures(sequence, constraints, limit=10,
+                                 cursor=first["next_cursor"])
+```
+
+参数 `sequence`、`constraints` 与 `fold()` 完全一致；`limit` 为每批数量，
+要求 `1 <= limit <= 100`（`bool` 按整数契约拒绝）。
+
+| 返回键 | 类型 | 含义 |
+|---|---|---|
+| `structures` | `tuple[str, ...]` | 本批 dot-bracket，按字典序升序 |
+| `score` | `int` | 共同的最优分值 |
+| `count` | `int` | 最优结构总数（模 1 000 000 007），与已领取多少无关 |
+| `next_cursor` | `str \| None` | 不透明续取令牌；全部领完为 `None` |
+| `done` | `bool` | 恰在 `next_cursor is None` 时为 `True` |
+
+语义保证：
+
+- **每个返回结构都合法且最优**：满足全部强制配对/强制未配、最短发夹环、
+  互补、非交叉、单位置单配等全部硬约束，并达到最优分值。
+- **稳定顺序、绝不重复**：领取顺序为 dot-bracket 的严格字典序
+  （ASCII：`'(' < ')' < '.'`）；跨批次按游标顺序推进，同一结构不会返回两次。
+- **惰性展开**：未领取的结构不会提前在内存中展开。每次调用只做
+  “给定上界后的严格后继”有界搜索（本批 `limit` 个 + 判断是否结束的一次探测），
+  不在服务端/模块侧保存任何枚举状态；除游标字符串外，调用之间无隐藏状态。
+- **游标与输入绑定**：游标内带（序列 + 规范化后的约束）的 SHA-256 指纹与
+  HMAC 式完整性标记。换了序列（哪怕只差一个字符）或换了约束都不能沿用，
+  直接抛 `CursorError`；等价的约束写法（如自由折叠与全 `.` 串）规范化后
+  相同，可以沿用。游标是一次性的“续取位置”，可以安全地跨进程/序列化传递，
+  但不应被当作可人工解析的数据结构（格式 `rf1_...`，不保证跨版本兼容）。
+
 ### 合法结构规则（题面契约）
 
 - 只允许 `AU, UA, GC, CG, GU, UG` 六种配对；
@@ -80,6 +120,8 @@ result = fold(sequence, constraints=None)
   约束良构但被**精确搜索证明无解**。当前实现下，单个强制配对的物理可行性
   （距离、互补性）与配对间冲突已在输入校验全部拒绝，因此正常输入不会到达此分支；
   保留该异常是为了让「证明无解」这一语义有稳定、可捕获的公开类型。
+- `rna_fold.CursorError(ValueError)`：续取游标损坏、被篡改，或与本次传入的
+  （序列、约束）不一致（包括换了序列仍沿用旧游标）。
 - `rna_fold.BudgetExceededError(RuntimeError)`：
   **搜索预算耗尽**（未能证明最优）。它与「证明无解」是刻意分开的两个类型，
   互不构成子类。由于 n ≤ 120 时精确 DP 总是完整枚举整个解空间，本实现**永不
@@ -107,6 +149,14 @@ result = fold(sequence, constraints=None)
   可达性只由分值表（可行性）决定，**不使用取模后的计数**，因此即使某子结构
   集合数量恰为模数倍数（计数显示 0），配对集合仍然精确。测试
   `test_pair_set_independent_of_count_modulus` 用小模数白盒验证了这一点。
+- **并列最优的惰性枚举（批次领取）**：DP 为每个区间额外记录其最优决策
+  “模板”（固定括号字符 + 指向子区间最优集的节点），但**不实例化**具体结构。
+  枚举器只在领取时回答两个查询：串 `s` 是否属于某区间的最优集
+  （membership），以及严格大于 `s` 的最小最优串（successor）。后继搜索在模板的
+  “分歧节点”上组合：分歧点之前必须与上界逐段相等，分歧点要么是一个变大的
+  固定字符、要么是某个子区间自己的后继，分歧点之后各子区间取各自字典序最小。
+  因此每批只展开 `limit` 个后继与一次结束探测，未领取的结构始终不进入内存；
+  内存主要仍为 DP 的 O(n²) 表，n=120 实测约 23 MB RSS。
 
 ### 与独立参考的关系
 
@@ -130,16 +180,18 @@ result = fold(sequence, constraints=None)
   无温度、无自由能 kcal/mol、无堆栈/凸包/多分支环能量项），不与 ViennaRNA 等
   行业标准兼容。
 - 禁止假结（非交叉）；不预测三链、修饰碱基、非 `ACGU` 字母（如 N、I）。
-- 只输出单一字典序最小最优结构；其余并列最优结构以 `count` 与 `pairs` 概括，
-  不逐个枚举（n=120 时枚举全部结构不现实）。
+- `fold()` 只输出单一字典序最小最优结构；其余并列最优结构可通过
+  `claim_optimal_structures()` 按批次稳定领取（见上文）。未领取的结构不会被提前
+  展开；但**同一输入的并列最优结构总数可能是指数级**，实际逐批全部领完仍受该
+  总数限制——接口保证的是“不提前展开”，而不是“指数结构变多项式输出”。
 - `BudgetExceededError` 在当前确定性 DP 下不会被抛出；它是为语义完整性保留的
   公开类型。
 
 ## 仓库内容
 
 ```
-rna_fold.py            # 核心模块：fold() 与公开异常/常量
-demo.py                # 固定输入演示（真实计算 + 真实拒绝）
+rna_fold.py            # 核心模块：fold()、claim_optimal_structures() 与公开异常/常量
+demo.py                # 固定输入演示（真实计算 + 批次领取 + 真实拒绝）
 tests/test_fold.py     # 必要测试（对拍、约束、GU、并列最优、非法输入等）
 tests/brute_reference.py  # 独立穷举参考（n<=14，不调用被测核心）
 README.md

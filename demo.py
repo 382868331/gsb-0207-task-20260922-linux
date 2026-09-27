@@ -14,7 +14,9 @@ import time
 
 from rna_fold import (
     ConstraintError,
+    CursorError,
     InvalidSequenceError,
+    claim_optimal_structures,
     fold,
 )
 
@@ -84,8 +86,46 @@ def main() -> None:
     else:  # pragma: no cover
         raise AssertionError("expected an InvalidSequenceError")
 
+    # --- 5. Batched claiming of tied-optimal structures -----------------
+    # This sequence has four distinct maximum-score structures.  Claim them
+    # in batches of 2 using the opaque continuation cursor; order is stable
+    # (strict dot-bracket lex order) and nothing is returned twice.
+    tie_seq = "CGUCACGACCGG"
     print("=" * 64)
-    print("demo finished: 2 successful folds and 2 live rejections.")
+    print("5) Batched claiming of tied-optimal structures (limit=2)")
+    print(f"sequence    : {tie_seq}  (n={len(tie_seq)})")
+    cursor = None
+    batch_no = 0
+    seen = set()
+    while True:
+        batch_no += 1
+        batch = claim_optimal_structures(tie_seq, None, 2, cursor)
+        for structure in batch["structures"]:
+            assert structure not in seen, "structure returned twice"
+            seen.add(structure)
+            print(f"  batch {batch_no}: {structure}  (score {batch['score']})")
+        cursor = batch["next_cursor"]
+        if batch["done"]:
+            break
+    print(f"total claimed: {len(seen)} distinct structures "
+          f"(count field: {batch['count']})")
+
+    # --- 6. Cursor is bound to its concrete input -----------------------
+    print("=" * 64)
+    print("6) Continuation cursor bound to the input: reuse on a changed")
+    print("   sequence is rejected")
+    first = claim_optimal_structures(tie_seq, None, 1)
+    print(f"sequence    : {tie_seq!r}, first structure: "
+          f"{first['structures'][0]!r}")
+    try:
+        claim_optimal_structures("CGUCACGACCGU", None, 1, first["next_cursor"])
+    except CursorError as exc:
+        print(f"raised      : {type(exc).__name__}: {exc}")
+    else:  # pragma: no cover
+        raise AssertionError("expected a CursorError")
+
+    print("=" * 64)
+    print("demo finished: folds, tied-optima batches, and live rejections.")
 
 
 if __name__ == "__main__":

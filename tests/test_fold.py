@@ -15,10 +15,13 @@ from rna_fold import (
     MOD,
     BudgetExceededError,
     ConstraintError,
+    CursorError,
     InvalidSequenceError,
     UnsatisfiableConstraintError,
+    claim_optimal_structures,
     fold,
 )
+from tests.brute_reference import _enumerate
 from tests.brute_reference import brute_force
 
 PAIR_SCORES = {
@@ -443,6 +446,141 @@ class BoundaryAndPerformanceTests(unittest.TestCase):
             res = fold(seq)
             self.assertTrue(set(res["structure"]) <= {"(", ")", "."})
 
+
+class BatchedClaimTests(unittest.TestCase):
+    """Batched claiming of tied-optimal structures, cross-checked by the
+    independent brute-force enumerator (n <= 14)."""
+
+    def _ref_optimal_strings(self, seq, forced=(), unpaired=()):
+        forced_set = frozenset(forced)
+        unpaired_set = frozenset(unpaired)
+        ref = brute_force(seq, forced_set, unpaired_set)
+        self.assertTrue(ref["feasible"])
+        up = [p in unpaired_set for p in range(len(seq))]
+        strings = sorted(
+            s
+            for score, s, pairs in _enumerate(seq, up)
+            if score == ref["score"] and forced_set <= pairs
+        )
+        return ref, strings
+
+    def test_claim_all_in_stable_lex_order(self):
+        seq = "CGUCACGACCGG"  # four tied optima
+        claimed = []
+        cursor = None
+        batches = 0
+        while True:
+            batch = claim_optimal_structures(seq, None, 2, cursor)
+            batches += 1
+            claimed.extend(batch["structures"])
+            for structure in batch["structures"]:
+                self.assertTrue(structure_is_legal(seq, structure))
+            cursor = batch["next_cursor"]
+            if batch["done"]:
+                self.assertIsNone(cursor)
+                break
+            self.assertIsNotNone(cursor)
+            self.assertEqual(len(batch["structures"]), 2)
+        ref, expected = self._ref_optimal_strings(seq)
+        self.assertEqual(claimed, expected)
+        self.assertEqual(batches, 2)  # two batches of 2, the last one done
+
+    def test_batches_never_repeat_and_first_is_fold_structure(self):
+        rng = random.Random(20260927)
+        for _ in range(120):
+            n = rng.randint(1, 14)
+            seq = "".join(rng.choice("ACGU") for _ in range(n))
+            limit = rng.choice([1, 2, 3, 5, 50])
+            ref, expected = self._ref_optimal_strings(seq)
+            claimed = []
+            cursor = None
+            while True:
+                batch = claim_optimal_structures(seq, None, limit, cursor)
+                claimed.extend(batch["structures"])
+                self.assertEqual(batch["score"], ref["score"])
+                self.assertEqual(batch["count"], ref["exact_count"])
+                cursor = batch["next_cursor"]
+                if batch["done"]:
+                    break
+            self.assertEqual(claimed, expected)
+            self.assertEqual(len(claimed), len(set(claimed)))
+            self.assertEqual(claimed[0], fold(seq)["structure"])
+
+    def test_claims_respect_forced_constraints(self):
+        seq = "GGCGAUUAGCCGAUU"
+        forced = (0, 14)
+        cursor = None
+        seen = set()
+        for _ in range(10):
+            batch = claim_optimal_structures(
+                seq, {"pairs": [forced]}, 1, cursor
+            )
+            for structure in batch["structures"]:
+                self.assertTrue(structure_is_legal(seq, structure))
+                self.assertIn(forced, structure_pairs(structure))
+                self.assertNotIn(structure, seen)
+                seen.add(structure)
+            cursor = batch["next_cursor"]
+            if batch["done"]:
+                break
+        ref, expected = self._ref_optimal_strings(seq, [forced])
+        self.assertEqual(sorted(seen), expected)
+
+    def test_string_and_dict_constraint_forms_share_cursor(self):
+        seq = "CGUCACGACCGG"
+        first = claim_optimal_structures(seq, None, 1)
+        # The fully-free dot string normalises to the same constraint set.
+        second = claim_optimal_structures(seq, "." * len(seq), 1, first["next_cursor"])
+        ref, expected = self._ref_optimal_strings(seq)
+        self.assertEqual(
+            [first["structures"][0]] + list(second["structures"]),
+            expected[: 1 + len(second["structures"])],
+        )
+
+    def test_cursor_rejected_for_different_input(self):
+        seq = "CGUCACGACCGG"
+        cursor = claim_optimal_structures(seq, None, 1)["next_cursor"]
+        self.assertIsNotNone(cursor)
+        with self.assertRaises(CursorError):
+            claim_optimal_structures("CGUCACGACCGU", None, 1, cursor)
+        with self.assertRaises(CursorError):
+            claim_optimal_structures(seq, {"unpaired": [0]}, 1, cursor)
+
+    def test_malformed_and_tampered_cursor_rejected(self):
+        seq = "CGUCACGACCGG"
+        cursor = claim_optimal_structures(seq, None, 1)["next_cursor"]
+        for bad in ("garbage", "", "rf1_xxxx", cursor[:-1] + (
+            "A" if cursor[-1] != "A" else "B"
+        )):
+            with self.assertRaises(CursorError):
+                claim_optimal_structures(seq, None, 1, bad)
+        with self.assertRaises(CursorError):
+            claim_optimal_structures(seq, None, 1, 123)
+
+    def test_limit_validation(self):
+        for bad in (0, -1, 101, 1000):
+            with self.assertRaises(ValueError):
+                claim_optimal_structures("ACGUACGU", None, bad)
+        with self.assertRaises(TypeError):
+            claim_optimal_structures("ACGUACGU", None, True)
+        with self.assertRaises(TypeError):
+            claim_optimal_structures("ACGUACGU", None, 1.5)
+        with self.assertRaises(ValueError):
+            claim_optimal_structures("ACGUACGU", None, math.nan)
+
+    def test_unique_optimum_finishes_in_one_batch(self):
+        seq = "GCGCGCGCGC"
+        batch = claim_optimal_structures(seq, None, 10)
+        self.assertEqual(len(batch["structures"]), 1)
+        self.assertTrue(batch["done"])
+        self.assertIsNone(batch["next_cursor"])
+        self.assertEqual(batch["structures"][0], fold(seq)["structure"])
+
+    def test_empty_sequence_batch(self):
+        batch = claim_optimal_structures("")
+        self.assertEqual(batch["structures"], ("",))
+        self.assertEqual(batch["score"], 0)
+        self.assertTrue(batch["done"])
 
 if __name__ == "__main__":
     unittest.main()
